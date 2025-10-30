@@ -495,7 +495,11 @@ func CreateProduct(c *gin.Context) {
 			imageQuery := `INSERT INTO product_images (id, product_model_id, product_color_id, url, alt, position, created_at) 
 			               VALUES ($1, $2, $3, $4, $5, $6, $7)`
 			
-			_, err = tx.Exec(imageQuery, imageID, productModelID, colorID, image.URL, image.Alt, image.Position, now)
+			url := image.URL
+			if len(url) >= 7 && url[:7] == "http://" {
+				url = "https://" + url[7:]
+			}
+			_, err = tx.Exec(imageQuery, imageID, productModelID, colorID, url, image.Alt, image.Position, now)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create product image"})
 				return
@@ -755,8 +759,12 @@ func UpdateProduct(c *gin.Context) {
 						position = index + 1 // Use array index + 1 if position not specified
 					}
 					
+					url := img.URL
+					if len(url) >= 7 && url[:7] == "http://" {
+						url = "https://" + url[7:]
+					}
 					_, err = tx.Exec("INSERT INTO product_images (id, product_model_id, product_color_id, url, alt, position, created_at) VALUES ($1, $2, $3, $4, $5, $6, now())",
-						imageID, productID, colorID, img.URL, img.Alt, position)
+						imageID, productID, colorID, url, img.Alt, position)
 					if err != nil {
 						fmt.Printf("Error inserting image: %v\n", err)
 						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to insert image"})

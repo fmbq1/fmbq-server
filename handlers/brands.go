@@ -128,7 +128,11 @@ func CreateBrand(c *gin.Context) {
 	
 	var banner *string
 	if req.Banner != "" {
-		banner = &req.Banner
+		b := req.Banner
+		if len(b) >= 7 && b[:7] == "http://" {
+			b = "https://" + b[7:]
+		}
+		banner = &b
 	}
 	
 	var color *string
@@ -224,7 +228,11 @@ func UpdateBrand(c *gin.Context) {
 	
 	var banner *string
 	if req.Banner != "" {
-		banner = &req.Banner
+		b := req.Banner
+		if len(b) >= 7 && b[:7] == "http://" {
+			b = "https://" + b[7:]
+		}
+		banner = &b
 	}
 	
 	var color *string

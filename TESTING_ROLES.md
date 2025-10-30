@@ -12,7 +12,7 @@
 
 ```bash
 # Using the admin signup endpoint
-curl -X POST http://192.168.100.9:8080/admin/signup \
+curl -X POST https://fmbq-server.onrender.com/admin/signup \
   -H "Content-Type: application/json" \
   -d '{
     "phone": "+22212345678",
@@ -49,15 +49,15 @@ curl -X POST http://192.168.100.9:8080/admin/signup \
 
 ```bash
 # Get all users (requires admin token)
-curl -X GET http://192.168.100.9:8080/api/v1/admin/users \
+curl -X GET https://fmbq-server.onrender.com/api/v1/admin/users \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
 
 # Get user statistics
-curl -X GET http://192.168.100.9:8080/api/v1/admin/users-stats \
+curl -X GET https://fmbq-server.onrender.com/api/v1/admin/users-stats \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
 
 # Update user role
-curl -X PUT http://192.168.100.9:8080/api/v1/admin/users/USER_ID/role \
+curl -X PUT https://fmbq-server.onrender.com/api/v1/admin/users/USER_ID/role \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"role": "employee"}'

@@ -227,6 +227,11 @@ func CreateBackground(c *gin.Context) {
 		return
 	}
 
+	// Normalize ImageURL to https
+	if len(req.ImageURL) >= 7 && req.ImageURL[:7] == "http://" {
+		req.ImageURL = "https://" + req.ImageURL[7:]
+	}
+
 	// Parse dates from strings
 	var startDate, endDate *time.Time
 	if req.StartDate != nil && *req.StartDate != "" {
@@ -380,6 +385,11 @@ func UpdateBackground(c *gin.Context) {
 			"error": "Invalid request format",
 		})
 		return
+	}
+
+	// Normalize ImageURL to https
+	if len(req.ImageURL) >= 7 && req.ImageURL[:7] == "http://" {
+		req.ImageURL = "https://" + req.ImageURL[7:]
 	}
 
 	db := database.Database

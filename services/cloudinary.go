@@ -55,7 +55,19 @@ func (cs *CloudinaryService) UploadImage(file multipart.File, folder string) (*u
 	if err != nil {
 		return nil, fmt.Errorf("failed to upload image: %w", err)
 	}
-	
+    // Normalize URLs to HTTPS to avoid production blocking
+    if result != nil {
+        if result.URL != "" {
+            result.URL = forceHTTPS(result.URL)
+        }
+        if result.SecureURL != "" {
+            result.SecureURL = forceHTTPS(result.SecureURL)
+        } else if result.URL != "" {
+            // Fallback: set SecureURL from URL
+            result.SecureURL = forceHTTPS(result.URL)
+        }
+    }
+
 	return result, nil
 }
 
@@ -80,7 +92,18 @@ func (cs *CloudinaryService) UploadImageFromBytes(data []byte, folder, filename 
 	if err != nil {
 		return nil, fmt.Errorf("failed to upload image: %w", err)
 	}
-	
+    // Normalize URLs to HTTPS to avoid production blocking
+    if result != nil {
+        if result.URL != "" {
+            result.URL = forceHTTPS(result.URL)
+        }
+        if result.SecureURL != "" {
+            result.SecureURL = forceHTTPS(result.SecureURL)
+        } else if result.URL != "" {
+            result.SecureURL = forceHTTPS(result.URL)
+        }
+    }
+
 	return result, nil
 }
 
@@ -102,7 +125,7 @@ func (cs *CloudinaryService) DeleteImage(publicID string) error {
 func (cs *CloudinaryService) GetImageURL(publicID string, transformations ...string) string {
 	// For Cloudinary v2, we need to construct the URL manually
 	// This is a simplified version - in production you might want to use a proper URL builder
-	baseURL := "https://res.cloudinary.com"
+    baseURL := "https://res.cloudinary.com"
 	cloudName := cs.cld.Config.Cloud.CloudName
 	
 	if cloudName == "" {
@@ -118,7 +141,7 @@ func (cs *CloudinaryService) GetImageURL(publicID string, transformations ...str
 	
 	url += "/" + publicID
 	
-	return url
+    return forceHTTPS(url)
 }
 
 func (cs *CloudinaryService) GenerateTransformationURL(publicID string, width, height int, crop string) string {
@@ -130,7 +153,7 @@ func (cs *CloudinaryService) GenerateTransformationURL(publicID string, width, h
 		"f_auto",
 	}
 	
-	return cs.GetImageURL(publicID, transformations...)
+    return forceHTTPS(cs.GetImageURL(publicID, transformations...))
 }
 
 // Helper function to extract public ID from Cloudinary URL
@@ -140,7 +163,7 @@ func ExtractPublicID(url string) string {
 	if len(parts) < 4 {
 		return ""
 	}
-	
+    
 	// Find the "upload" part and take everything after it
 	for i, part := range parts {
 		if part == "upload" && i+1 < len(parts) {
@@ -159,4 +182,15 @@ func ExtractPublicID(url string) string {
 	}
 	
 	return ""
+}
+
+// forceHTTPS ensures Cloudinary URLs use https scheme
+func forceHTTPS(in string) string {
+    if in == "" {
+        return in
+    }
+    // Trim whitespace and force https
+    out := strings.TrimSpace(in)
+    out = strings.Replace(out, "http://", "https://", 1)
+    return out
 }

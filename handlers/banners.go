@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"fmbq-server/database"
@@ -258,8 +259,13 @@ func CreateBanner(c *gin.Context) {
 		return
 	}
 
-	// Validate required fields
-	if request.Title == "" || request.ImageURL == "" {
+    // Normalize and validate
+    request.ImageURL = strings.TrimSpace(request.ImageURL)
+    if strings.HasPrefix(strings.ToLower(request.ImageURL), "http://") {
+        request.ImageURL = "https://" + strings.TrimPrefix(request.ImageURL, "http://")
+    }
+
+    if request.Title == "" || request.ImageURL == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "Title and image URL are required",
 		})
@@ -283,7 +289,7 @@ func CreateBanner(c *gin.Context) {
 		categoryID = nil
 	}
 
-	err := db.QueryRow(query,
+    err := db.QueryRow(query,
 		request.Title,
 		request.ImageURL,
 		request.SortOrder,
@@ -300,7 +306,7 @@ func CreateBanner(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
+    c.JSON(http.StatusCreated, gin.H{
 		"success": true,
 		"data": gin.H{
 			"id":          bannerID,
@@ -423,7 +429,7 @@ func UploadBannerImage(c *gin.Context) {
 
 	// Upload to Cloudinary using the same service as other uploads
 	folder := "banners"
-	uploadResult, err := services.Cloudinary.UploadImageFromBytes(fileBytes, file.Filename, folder)
+    uploadResult, err := services.Cloudinary.UploadImageFromBytes(fileBytes, folder, file.Filename)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": "Failed to upload image to Cloudinary",
