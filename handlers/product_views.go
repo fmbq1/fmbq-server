@@ -4,7 +4,9 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
+	"time"
 
 	"fmbq-server/database"
 
@@ -222,6 +224,182 @@ func GetMostViewedProducts(c *gin.Context) {
 		"success": true,
 		"data":    products,
 		"count":   len(products),
+	})
+}
+
+// GetUserRecentlyViewedProducts handles GET /api/v1/products/recently-viewed
+// Returns products the authenticated user has recently viewed, ordered by most recent first
+func GetUserRecentlyViewedProducts(c *gin.Context) {
+	// Get user ID from auth context (required for this endpoint)
+	userIDInterface, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		return
+	}
+
+	userIDStr, ok := userIDInterface.(string)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID format"})
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "10")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 || limit > 50 {
+		limit = 10
+	}
+
+	// Get user's recently viewed products, ordered by most recent first
+	// First get distinct product IDs with their latest view timestamp
+	query := `
+		WITH latest_views AS (
+			SELECT DISTINCT ON (pv.product_id)
+				pv.product_id,
+				pv.view_timestamp
+			FROM product_views pv
+			WHERE pv.user_id = $1
+			ORDER BY pv.product_id, pv.view_timestamp DESC
+		)
+		SELECT 
+			lv.product_id,
+			lv.view_timestamp,
+			pm.id,
+			pm.title,
+			pm.model_code,
+			pm.description,
+			b.name as brand_name,
+			b.color as brand_color,
+			COALESCE(MIN(pr.sale_price), MIN(pr.list_price), 0) as min_price,
+			COALESCE(MAX(pr.list_price), 0) as original_price,
+			COALESCE(pi.url, '') as main_image_url
+		FROM latest_views lv
+		INNER JOIN product_models pm ON lv.product_id = pm.id
+		LEFT JOIN brands b ON pm.brand_id = b.id
+		LEFT JOIN skus s ON pm.id = s.product_model_id
+		LEFT JOIN prices pr ON s.id = pr.sku_id AND pr.currency = 'MRO'
+		LEFT JOIN LATERAL (
+			SELECT url 
+			FROM product_images 
+			WHERE product_model_id = pm.id 
+			ORDER BY position, created_at
+			LIMIT 1
+		) pi ON true
+		WHERE pm.is_active = true
+		GROUP BY lv.product_id, lv.view_timestamp, pm.id, pm.title, pm.model_code, pm.description, b.name, b.color, pi.url
+		ORDER BY lv.view_timestamp DESC
+		LIMIT $2
+	`
+
+	rows, err := database.Database.Query(query, userID, limit)
+	if err != nil {
+		fmt.Printf("Error fetching recently viewed products: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch recently viewed products"})
+		return
+	}
+	defer rows.Close()
+
+	type productWithTime struct {
+		product     map[string]interface{}
+		viewTime    time.Time
+	}
+
+	var productsWithTime []productWithTime
+
+	for rows.Next() {
+		var (
+			productID          uuid.UUID
+			viewTimestamp     time.Time
+			pmID               uuid.UUID
+			title, modelCode  sql.NullString
+			description       sql.NullString
+			brandName         sql.NullString
+			brandColor        sql.NullString
+			minPrice, originalPrice sql.NullFloat64
+			mainImageURL      sql.NullString
+		)
+
+		err := rows.Scan(
+			&productID, &viewTimestamp, &pmID, &title, &modelCode, &description,
+			&brandName, &brandColor, &minPrice, &originalPrice, &mainImageURL,
+		)
+		if err != nil {
+			fmt.Printf("Error scanning row: %v\n", err)
+			continue
+		}
+
+		// Fetch all images for this product
+		imagesQuery := `SELECT id, url, alt, position, created_at 
+		                FROM product_images WHERE product_model_id = $1 ORDER BY position, created_at`
+		imagesRows, err := database.Database.Query(imagesQuery, pmID)
+		var images []map[string]interface{}
+		if err == nil {
+			defer imagesRows.Close()
+			for imagesRows.Next() {
+				var imgID, imgURL, imgAlt sql.NullString
+				var imgPosition sql.NullInt32
+				var imgCreatedAt time.Time
+				if err := imagesRows.Scan(&imgID, &imgURL, &imgAlt, &imgPosition, &imgCreatedAt); err == nil {
+					images = append(images, map[string]interface{}{
+						"id":         imgID.String,
+						"url":        imgURL.String,
+						"alt":        imgAlt.String,
+						"position":   imgPosition.Int32,
+						"created_at": imgCreatedAt,
+					})
+				}
+			}
+		}
+
+		productData := map[string]interface{}{
+			"id":             pmID.String(),
+			"title":          title.String,
+			"model_code":     modelCode.String,
+			"description":    description.String,
+			"brand_name":     brandName.String,
+			"brand_color":    brandColor.String,
+			"image_url":      mainImageURL.String,
+			"images":         images,
+			"price":          minPrice.Float64,
+			"original_price": originalPrice.Float64,
+		}
+
+		productsWithTime = append(productsWithTime, productWithTime{
+			product:  productData,
+			viewTime: viewTimestamp,
+		})
+	}
+
+	// Sort by view_timestamp (most recent first)
+	sort.Slice(productsWithTime, func(i, j int) bool {
+		return productsWithTime[i].viewTime.After(productsWithTime[j].viewTime)
+	})
+
+	// Remove duplicates (keep first occurrence which is most recent)
+	seen := make(map[string]bool)
+	var uniqueProducts []map[string]interface{}
+	for _, pwt := range productsWithTime {
+		id := pwt.product["id"].(string)
+		if !seen[id] {
+			seen[id] = true
+			uniqueProducts = append(uniqueProducts, pwt.product)
+			if len(uniqueProducts) >= limit {
+				break
+			}
+		}
+	}
+
+	fmt.Printf("✅ Found %d recently viewed products for user %s\n", len(uniqueProducts), userID.String())
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    uniqueProducts,
+		"count":   len(uniqueProducts),
 	})
 }
 

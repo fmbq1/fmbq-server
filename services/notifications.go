@@ -19,13 +19,17 @@ type ExpoPushMessage struct {
 	Badge int                    `json:"badge,omitempty"`
 }
 
+// ExpoPushResponseItem represents a single push notification response item
+type ExpoPushResponseItem struct {
+	Status string `json:"status"`
+	ID     string `json:"id"`
+	Error  string `json:"message,omitempty"`
+}
+
 // ExpoPushResponse represents the response from Expo push service
+// Data can be either a single object or an array of objects
 type ExpoPushResponse struct {
-	Data []struct {
-		Status string `json:"status"`
-		ID     string `json:"id"`
-		Error  string `json:"message,omitempty"`
-	} `json:"data"`
+	Data json.RawMessage `json:"data"`
 }
 
 // NotificationService handles push notifications
@@ -46,6 +50,7 @@ func (ns *NotificationService) SendPushNotification(pushToken string, title, bod
 		return fmt.Errorf("push token is empty")
 	}
 
+	// Expo Push API expects messages in an array format
 	message := ExpoPushMessage{
 		To:    pushToken,
 		Title: title,
@@ -55,12 +60,15 @@ func (ns *NotificationService) SendPushNotification(pushToken string, title, bod
 		Badge: 1,
 	}
 
-	jsonData, err := json.Marshal(message)
+	// Send as array (batch format)
+	messages := []ExpoPushMessage{message}
+	jsonData, err := json.Marshal(messages)
 	if err != nil {
 		return fmt.Errorf("failed to marshal push message: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", ns.ExpoPushURL, bytes.NewBuffer(jsonData))
+    fmt.Printf("🔔 Sending push → token=%s title=%q body=%q\n", pushToken, title, body)
+    req, err := http.NewRequest("POST", ns.ExpoPushURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -73,9 +81,9 @@ func (ns *NotificationService) SendPushNotification(pushToken string, title, bod
 		Timeout: 30 * time.Second,
 	}
 
-	resp, err := client.Do(req)
+    resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to send push notification: %w", err)
+        return fmt.Errorf("failed to send push notification: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -85,21 +93,46 @@ func (ns *NotificationService) SendPushNotification(pushToken string, title, bod
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("push notification failed with status %d: %s", resp.StatusCode, string(responseBody))
+        fmt.Printf("🔔 Expo push error status=%d body=%s\n", resp.StatusCode, string(responseBody))
+        return fmt.Errorf("push notification failed with status %d: %s", resp.StatusCode, string(responseBody))
 	}
 
 	var pushResponse ExpoPushResponse
 	if err := json.Unmarshal(responseBody, &pushResponse); err != nil {
-		return fmt.Errorf("failed to parse response: %w", err)
+        fmt.Printf("🔔 Expo push parse error body=%s\n", string(responseBody))
+        return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// Check if any notifications failed
-	for _, result := range pushResponse.Data {
-		if result.Status == "error" {
-			return fmt.Errorf("push notification failed: %s", result.Error)
+	// Parse data field - can be either a single object or an array
+	var results []ExpoPushResponseItem
+	
+	// Try parsing as array first
+	var dataArray []ExpoPushResponseItem
+	if err := json.Unmarshal(pushResponse.Data, &dataArray); err == nil {
+		results = dataArray
+	} else {
+		// Try parsing as single object
+		var singleResult ExpoPushResponseItem
+		if err := json.Unmarshal(pushResponse.Data, &singleResult); err == nil {
+			results = []ExpoPushResponseItem{singleResult}
+		} else {
+			fmt.Printf("🔔 Expo push parse error: data is neither array nor object. Raw data: %s\n", string(pushResponse.Data))
+			return fmt.Errorf("failed to parse response data: %w", err)
 		}
 	}
 
+	// Check if any notifications failed
+	for _, result := range results {
+		if result.Status == "error" {
+            fmt.Printf("🔔 Expo push result error id=%s message=%s\n", result.ID, result.Error)
+            return fmt.Errorf("push notification failed: %s", result.Error)
+		}
+		if result.Status == "ok" {
+			fmt.Printf("🔔 Expo push result success id=%s\n", result.ID)
+		}
+	}
+
+    fmt.Printf("✅ Push sent successfully via Expo\n")
 	return nil
 }
 

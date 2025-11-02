@@ -369,7 +369,7 @@ func UpdatePushToken(c *gin.Context) {
 	fmt.Println("UpdatePushToken called")
 	
 	var req struct {
-		PushToken string `json:"push_token" binding:"required"`
+		PushToken string `json:"push_token"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -393,9 +393,19 @@ func UpdatePushToken(c *gin.Context) {
 	fmt.Printf("Updating push token for user ID: %v\n", userID)
 	fmt.Printf("Push token: %s\n", req.PushToken)
 
-	// Update push token in database
+	// If PushToken is empty, set it to NULL to disable notifications
+	var pushTokenValue interface{}
+	if req.PushToken == "" {
+		pushTokenValue = nil
+		fmt.Println("Clearing push token (disabling notifications)")
+	} else {
+		pushTokenValue = req.PushToken
+		fmt.Println("Setting push token (enabling notifications)")
+	}
+
+	// Update push token in database (NULL if empty string to disable)
 	query := `UPDATE users SET push_token = $1, updated_at = now() WHERE id = $2`
-	result, err := database.Database.Exec(query, req.PushToken, userID)
+	result, err := database.Database.Exec(query, pushTokenValue, userID)
 	if err != nil {
 		fmt.Printf("Database error: %v\n", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -407,7 +417,13 @@ func UpdatePushToken(c *gin.Context) {
 	rowsAffected, _ := result.RowsAffected()
 	fmt.Printf("Rows affected: %d\n", rowsAffected)
 
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Push token updated successfully",
-	})
+	if req.PushToken == "" {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Notifications disabled successfully",
+		})
+	} else {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Push token updated successfully",
+		})
+	}
 }

@@ -361,20 +361,30 @@ func CreateOrder(c *gin.Context) {
 	}
 	fmt.Printf("✅ Transaction committed successfully\n")
 
-	// Send push notification for order creation
+	// Send push notification for order creation (async, non-blocking)
 	go func() {
+		fmt.Printf("🔔 Starting push notification process for order #%s\n", orderNumber)
+		
 		// Get user's push token and name
 		var pushToken, customerName sql.NullString
 		err := database.Database.QueryRow(`
-			SELECT push_token, COALESCE(full_name, name, 'Customer') 
+			SELECT push_token, COALESCE(full_name, phone, 'Customer') 
 			FROM users WHERE id = $1`, userID).Scan(&pushToken, &customerName)
 		
 		if err != nil {
-			fmt.Printf("⚠️ Failed to get user info for push notification: %v\n", err)
+			fmt.Printf("⚠️ Failed to get user info for push notification (user_id: %s): %v\n", userID, err)
 			return
 		}
 
+		fmt.Printf("👤 User info retrieved - Name: %s, Has Token: %v\n", customerName.String, pushToken.Valid)
+
 		if pushToken.Valid && pushToken.String != "" {
+			tokenPreview := pushToken.String
+			if len(tokenPreview) > 20 {
+				tokenPreview = tokenPreview[:20] + "..."
+			}
+			fmt.Printf("📱 Sending push notification to token: %s\n", tokenPreview)
+			
 			notificationService := services.NewNotificationService()
 			err := notificationService.SendOrderCreatedNotification(
 				pushToken.String, 
@@ -383,12 +393,12 @@ func CreateOrder(c *gin.Context) {
 				request.TotalAmount,
 			)
 			if err != nil {
-				fmt.Printf("⚠️ Failed to send order creation notification: %v\n", err)
+				fmt.Printf("❌ Failed to send order creation notification: %v\n", err)
 			} else {
-				fmt.Printf("✅ Order creation notification sent successfully\n")
+				fmt.Printf("✅ Order creation notification sent successfully to user %s\n", userID)
 			}
 		} else {
-			fmt.Printf("ℹ️ No push token found for user, skipping notification\n")
+			fmt.Printf("ℹ️ No push token found for user %s, skipping notification\n", userID)
 		}
 	}()
 

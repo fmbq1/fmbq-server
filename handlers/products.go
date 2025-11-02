@@ -813,3 +813,455 @@ LIMIT $2`
     })
 }
 
+// GetProductSuggestions returns suggested products based on:
+// 1. Same subcategory (highest priority)
+// 2. Same brand (secondary priority)
+// 3. Random/best-selling products (fallback)
+// Returns full product info including images from product_images table
+func GetProductSuggestions(c *gin.Context) {
+	productID := c.Param("id")
+	limitStr := c.DefaultQuery("limit", "10")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 10
+	}
+
+	// Get current product's brand and subcategories (level 2 categories)
+	var brandID sql.NullString
+	brandQuery := `SELECT brand_id FROM product_models WHERE id = $1`
+	err = DB.QueryRow(brandQuery, productID).Scan(&brandID)
+	if err != nil {
+		fmt.Printf("Error fetching product brand: %v\n", err)
+		c.JSON(http.StatusNotFound, gin.H{"error": "Product not found"})
+		return
+	}
+
+	// Get subcategory IDs (level 2 categories) and parent category IDs (level 1) for the current product
+	subcategoryQuery := `
+		SELECT c.id::text, c.level
+		FROM product_model_categories pmc
+		JOIN categories c ON pmc.category_id = c.id
+		WHERE pmc.product_model_id = $1
+	`
+	subcategoryRows, err := DB.Query(subcategoryQuery, productID)
+	var subcategoryIDs []string
+	var parentCategoryIDs []string
+	if err == nil {
+		defer subcategoryRows.Close()
+		for subcategoryRows.Next() {
+			var catID string
+			var catLevel sql.NullInt32
+			if err := subcategoryRows.Scan(&catID, &catLevel); err == nil {
+				if catLevel.Valid && catLevel.Int32 == 2 {
+					subcategoryIDs = append(subcategoryIDs, catID)
+				} else if catLevel.Valid && catLevel.Int32 == 1 {
+					parentCategoryIDs = append(parentCategoryIDs, catID)
+				} else {
+					// If level is not set, determine by parent_id
+					checkLevelQuery := `SELECT parent_id FROM categories WHERE id = $1`
+					var parentID sql.NullString
+					err := DB.QueryRow(checkLevelQuery, catID).Scan(&parentID)
+					if err == nil {
+						if parentID.Valid && parentID.String != "" {
+							subcategoryIDs = append(subcategoryIDs, catID)
+						} else {
+							parentCategoryIDs = append(parentCategoryIDs, catID)
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	fmt.Printf("🔍 Suggestions for product %s: Found %d subcategories, %d parent categories, brand: %v\n", 
+		productID, len(subcategoryIDs), len(parentCategoryIDs), brandID.String)
+
+	var suggestions []gin.H
+	usedIDs := map[string]bool{productID: true} // Exclude current product
+
+	// Priority 1: Products with same subcategory (level 2 categories)
+	if len(subcategoryIDs) > 0 {
+		fmt.Printf("🔍 Priority 1: Looking for products in subcategories: %v\n", subcategoryIDs)
+		// Build query with IN clause for subcategory IDs
+		placeholders := ""
+		args := []interface{}{productID}
+		for i, subcatID := range subcategoryIDs {
+			if i > 0 {
+				placeholders += ","
+			}
+			placeholders += fmt.Sprintf("$%d", len(args)+1)
+			args = append(args, subcatID)
+		}
+		limitParam := len(args) + 1
+		args = append(args, limit)
+		
+		subcategoryQuery := fmt.Sprintf(`
+			SELECT DISTINCT ON (pm.id)
+				pm.id, pm.title, pm.model_code, pm.description,
+				b.name as brand_name, b.color as brand_color,
+				COALESCE(MIN(pr.sale_price), MIN(pr.list_price), 0) as min_price,
+				COALESCE(MAX(pr.list_price), 0) as original_price,
+				COALESCE(pi.url, '') as main_image_url
+			FROM product_models pm
+			INNER JOIN product_model_categories pmc ON pm.id = pmc.product_model_id
+			INNER JOIN categories c ON pmc.category_id = c.id AND c.id::text IN (%s) AND c.level = 2
+			LEFT JOIN brands b ON pm.brand_id = b.id
+			LEFT JOIN skus s ON pm.id = s.product_model_id
+			LEFT JOIN prices pr ON s.id = pr.sku_id AND pr.currency = 'MRO'
+			LEFT JOIN LATERAL (
+				SELECT url 
+				FROM product_images 
+				WHERE product_model_id = pm.id 
+				ORDER BY position, created_at
+				LIMIT 1
+			) pi ON true
+			WHERE pm.is_active = true
+				AND pm.id != $1
+			GROUP BY pm.id, pm.title, pm.model_code, pm.description, b.name, b.color, pi.url
+			ORDER BY pm.id, pm.created_at DESC
+			LIMIT $%d
+		`, placeholders, limitParam)
+		
+		rows, err := DB.Query(subcategoryQuery, args...)
+		if err != nil {
+			fmt.Printf("❌ Subcategory query error: %v\n", err)
+		} else {
+			defer rows.Close()
+			count := 0
+			for rows.Next() {
+				var id, title, modelCode, brandName, mainImageURL string
+				var description sql.NullString
+				var brandColor sql.NullString
+				var minPrice, originalPrice sql.NullFloat64
+				
+				if err := rows.Scan(&id, &title, &modelCode, &description, &brandName, &brandColor, &minPrice, &originalPrice, &mainImageURL); err == nil {
+					if !usedIDs[id] {
+						productData := buildSuggestionProduct(id, title, modelCode, description, brandName, brandColor, mainImageURL, minPrice, originalPrice)
+						suggestions = append(suggestions, productData)
+						usedIDs[id] = true
+						count++
+					}
+				}
+			}
+			fmt.Printf("✅ Priority 1: Found %d products from subcategories\n", count)
+		}
+	} else {
+		fmt.Printf("⚠️ No subcategories found for product %s\n", productID)
+	}
+
+	// Priority 1b: Products with same parent category (if we don't have enough from subcategories)
+	if len(suggestions) < limit && len(parentCategoryIDs) > 0 {
+		fmt.Printf("🔍 Priority 1b: Looking for products in parent categories: %v\n", parentCategoryIDs)
+		needed := limit - len(suggestions)
+		// Build query with IN clause for parent category IDs
+		placeholders := ""
+		args := []interface{}{productID}
+		for i, parentCatID := range parentCategoryIDs {
+			if i > 0 {
+				placeholders += ","
+			}
+			placeholders += fmt.Sprintf("$%d", len(args)+1)
+			args = append(args, parentCatID)
+		}
+		limitParam := len(args) + 1
+		args = append(args, needed)
+		
+		parentCategoryQuery := fmt.Sprintf(`
+			SELECT DISTINCT ON (pm.id)
+				pm.id, pm.title, pm.model_code, pm.description,
+				b.name as brand_name, b.color as brand_color,
+				COALESCE(MIN(pr.sale_price), MIN(pr.list_price), 0) as min_price,
+				COALESCE(MAX(pr.list_price), 0) as original_price,
+				COALESCE(pi.url, '') as main_image_url
+			FROM product_models pm
+			INNER JOIN product_model_categories pmc ON pm.id = pmc.product_model_id
+			INNER JOIN categories c ON pmc.category_id = c.id AND (c.id::text IN (%s) OR c.parent_id::text IN (%s))
+			LEFT JOIN brands b ON pm.brand_id = b.id
+			LEFT JOIN skus s ON pm.id = s.product_model_id
+			LEFT JOIN prices pr ON s.id = pr.sku_id AND pr.currency = 'MRO'
+			LEFT JOIN LATERAL (
+				SELECT url 
+				FROM product_images 
+				WHERE product_model_id = pm.id 
+				ORDER BY position, created_at
+				LIMIT 1
+			) pi ON true
+			WHERE pm.is_active = true
+				AND pm.id != $1
+			GROUP BY pm.id, pm.title, pm.model_code, pm.description, b.name, b.color, pi.url
+			ORDER BY pm.id, pm.created_at DESC
+			LIMIT $%d
+		`, placeholders, placeholders, limitParam)
+		
+		rows, err := DB.Query(parentCategoryQuery, args...)
+		if err != nil {
+			fmt.Printf("❌ Parent category query error: %v\n", err)
+		} else {
+			defer rows.Close()
+			count := 0
+			for rows.Next() {
+				var id, title, modelCode, brandName, mainImageURL string
+				var description sql.NullString
+				var brandColor sql.NullString
+				var minPrice, originalPrice sql.NullFloat64
+				
+				if err := rows.Scan(&id, &title, &modelCode, &description, &brandName, &brandColor, &minPrice, &originalPrice, &mainImageURL); err == nil {
+					if !usedIDs[id] {
+						productData := buildSuggestionProduct(id, title, modelCode, description, brandName, brandColor, mainImageURL, minPrice, originalPrice)
+						suggestions = append(suggestions, productData)
+						usedIDs[id] = true
+						count++
+					}
+				}
+			}
+			fmt.Printf("✅ Priority 1b: Found %d products from parent categories\n", count)
+		}
+	}
+
+	// Priority 2: Products with same brand (if we don't have enough suggestions)
+	if len(suggestions) < limit && brandID.Valid && brandID.String != "" {
+		needed := limit - len(suggestions)
+		fmt.Printf("🔍 Priority 2: Looking for products from brand %s (need %d more)\n", brandID.String, needed)
+		brandQuery := `
+			SELECT DISTINCT ON (pm.id)
+				pm.id, pm.title, pm.model_code, pm.description,
+				b.name as brand_name, b.color as brand_color,
+				COALESCE(MIN(pr.sale_price), MIN(pr.list_price), 0) as min_price,
+				COALESCE(MAX(pr.list_price), 0) as original_price,
+				COALESCE(pi.url, '') as main_image_url
+			FROM product_models pm
+			LEFT JOIN brands b ON pm.brand_id = b.id
+			LEFT JOIN skus s ON pm.id = s.product_model_id
+			LEFT JOIN prices pr ON s.id = pr.sku_id AND pr.currency = 'MRO'
+			LEFT JOIN LATERAL (
+				SELECT url 
+				FROM product_images 
+				WHERE product_model_id = pm.id 
+				ORDER BY position, created_at
+				LIMIT 1
+			) pi ON true
+			WHERE pm.is_active = true
+				AND pm.brand_id = $1
+				AND pm.id != $2
+			GROUP BY pm.id, pm.title, pm.model_code, pm.description, b.name, b.color, pi.url
+			ORDER BY pm.id, pm.created_at DESC
+			LIMIT $3
+		`
+		
+		rows, err := DB.Query(brandQuery, brandID.String, productID, needed)
+		if err != nil {
+			fmt.Printf("❌ Brand query error: %v\n", err)
+		} else {
+			defer rows.Close()
+			countBefore := len(suggestions)
+			for rows.Next() {
+				var id, title, modelCode, brandName, mainImageURL string
+				var description sql.NullString
+				var brandColor sql.NullString
+				var minPrice, originalPrice sql.NullFloat64
+				
+				if err := rows.Scan(&id, &title, &modelCode, &description, &brandName, &brandColor, &minPrice, &originalPrice, &mainImageURL); err == nil {
+					if !usedIDs[id] {
+						productData := buildSuggestionProduct(id, title, modelCode, description, brandName, brandColor, mainImageURL, minPrice, originalPrice)
+						suggestions = append(suggestions, productData)
+						usedIDs[id] = true
+					}
+				}
+			}
+			fmt.Printf("✅ Priority 2: Added %d products from brand (total: %d)\n", len(suggestions)-countBefore, len(suggestions))
+		}
+	}
+
+	// Priority 3: Popular/recent products (if we still don't have enough)
+	if len(suggestions) < limit {
+		needed := limit - len(suggestions)
+		fmt.Printf("🔍 Priority 3: Using fallback - need %d more products\n", needed)
+		
+		// Build exclusion list
+		excludedIDs := []string{productID}
+		for _, s := range suggestions {
+			if id, ok := s["id"].(string); ok {
+				excludedIDs = append(excludedIDs, id)
+			}
+		}
+		
+		// If too many exclusions, just use NOT EQUAL for the current product
+		var randomQuery string
+		var args []interface{}
+		
+		if len(excludedIDs) <= 10 {
+			// Build IN clause for exclusions
+			exclusionPlaceholders := ""
+			for i, excludedID := range excludedIDs {
+				if i > 0 {
+					exclusionPlaceholders += ","
+				}
+				exclusionPlaceholders += fmt.Sprintf("$%d", i+1)
+				args = append(args, excludedID)
+			}
+			neededParam := len(args) + 1
+			args = append(args, needed)
+			
+			randomQuery = fmt.Sprintf(`
+				SELECT DISTINCT ON (pm.id)
+					pm.id, pm.title, pm.model_code, pm.description,
+					b.name as brand_name, b.color as brand_color,
+					COALESCE(MIN(pr.sale_price), MIN(pr.list_price), 0) as min_price,
+					COALESCE(MAX(pr.list_price), 0) as original_price,
+					COALESCE(pi.url, '') as main_image_url
+				FROM product_models pm
+				LEFT JOIN brands b ON pm.brand_id = b.id
+				LEFT JOIN skus s ON pm.id = s.product_model_id
+				LEFT JOIN prices pr ON s.id = pr.sku_id AND pr.currency = 'MRO'
+				LEFT JOIN LATERAL (
+					SELECT url 
+					FROM product_images 
+					WHERE product_model_id = pm.id 
+					ORDER BY position, created_at
+					LIMIT 1
+				) pi ON true
+				WHERE pm.is_active = true
+					AND pm.id NOT IN (%s)
+				GROUP BY pm.id, pm.title, pm.model_code, pm.description, b.name, b.color, pi.url
+				ORDER BY pm.id, pm.created_at DESC
+				LIMIT $%d
+			`, exclusionPlaceholders, neededParam)
+		} else {
+			// Too many exclusions, use simpler query
+			args = []interface{}{productID, needed}
+			randomQuery = `
+				SELECT DISTINCT ON (pm.id)
+					pm.id, pm.title, pm.model_code, pm.description,
+					b.name as brand_name, b.color as brand_color,
+					COALESCE(MIN(pr.sale_price), MIN(pr.list_price), 0) as min_price,
+					COALESCE(MAX(pr.list_price), 0) as original_price,
+					COALESCE(pi.url, '') as main_image_url
+				FROM product_models pm
+				LEFT JOIN brands b ON pm.brand_id = b.id
+				LEFT JOIN skus s ON pm.id = s.product_model_id
+				LEFT JOIN prices pr ON s.id = pr.sku_id AND pr.currency = 'MRO'
+				LEFT JOIN LATERAL (
+					SELECT url 
+					FROM product_images 
+					WHERE product_model_id = pm.id 
+					ORDER BY position, created_at
+					LIMIT 1
+				) pi ON true
+				WHERE pm.is_active = true
+					AND pm.id != $1
+				GROUP BY pm.id, pm.title, pm.model_code, pm.description, b.name, b.color, pi.url
+				ORDER BY pm.id, pm.created_at DESC
+				LIMIT $2
+			`
+		}
+		
+		rows, err := DB.Query(randomQuery, args...)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var id, title, modelCode, brandName, mainImageURL string
+				var description sql.NullString
+				var brandColor sql.NullString
+				var minPrice, originalPrice sql.NullFloat64
+				
+				if err := rows.Scan(&id, &title, &modelCode, &description, &brandName, &brandColor, &minPrice, &originalPrice, &mainImageURL); err == nil {
+					if !usedIDs[id] {
+						productData := buildSuggestionProduct(id, title, modelCode, description, brandName, brandColor, mainImageURL, minPrice, originalPrice)
+						suggestions = append(suggestions, productData)
+						usedIDs[id] = true
+						if len(suggestions) >= limit {
+							break
+						}
+					}
+				}
+			}
+		}
+		fmt.Printf("✅ Fallback suggestions: Total suggestions = %d\n", len(suggestions))
+	}
+
+	fmt.Printf("📊 Final suggestions count: %d (requested: %d)\n", len(suggestions), limit)
+	
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    suggestions,
+		"count":   len(suggestions),
+	})
+}
+
+// buildSuggestionProduct builds a complete product suggestion object with all required data
+func buildSuggestionProduct(id, title, modelCode string, description sql.NullString, brandName string, brandColor sql.NullString, mainImageURL string, minPrice, originalPrice sql.NullFloat64) gin.H {
+	// Fetch all product images
+	imagesQuery := `SELECT id, url, alt, position, created_at 
+	                FROM product_images WHERE product_model_id = $1 ORDER BY position, created_at`
+	imagesRows, err := DB.Query(imagesQuery, id)
+	var images []gin.H
+	if err == nil {
+		defer imagesRows.Close()
+		for imagesRows.Next() {
+			var pi models.ProductImage
+			err := imagesRows.Scan(&pi.ID, &pi.URL, &pi.Alt, &pi.Position, &pi.CreatedAt)
+			if err == nil {
+				images = append(images, gin.H{
+					"id":         pi.ID,
+					"url":        pi.URL,
+					"alt":        pi.Alt,
+					"position":   pi.Position,
+					"created_at": pi.CreatedAt,
+				})
+			}
+		}
+	}
+
+	// Fetch colors
+	colors := getProductColors(id)
+	
+	// Fetch sizes
+	sizes := getProductSizes(id)
+	
+	// Fetch variants for pricing
+	variants := getProductVariants(id)
+	
+	// Calculate price and discount
+	price := 0.0
+	originalPriceVal := 0.0
+	if minPrice.Valid {
+		price = minPrice.Float64
+	}
+	if originalPrice.Valid {
+		originalPriceVal = originalPrice.Float64
+	}
+	
+	// If no price from aggregate, try from variants
+	if price == 0 && len(variants) > 0 {
+		if currentPrice, exists := variants[0]["current_price"]; exists {
+			price = currentPrice.(float64)
+		}
+		if listPrice, exists := variants[0]["list_price"]; exists {
+			originalPriceVal = listPrice.(float64)
+		}
+	}
+	
+	discountPercentage := 0
+	if originalPriceVal > 0 && price < originalPriceVal {
+		discountPercentage = int(((originalPriceVal - price) / originalPriceVal) * 100)
+	}
+
+	return gin.H{
+		"id":                  id,
+		"title":               title,
+		"description":         description.String,
+		"model_code":          modelCode,
+		"brand_name":          brandName,
+		"brand_color":         brandColor.String,
+		"image_url":          mainImageURL,
+		"images":              images,
+		"colors":              colors,
+		"sizes":               sizes,
+		"variants":            variants,
+		"price":               price,
+		"original_price":      originalPriceVal,
+		"discount_percentage": discountPercentage,
+		"has_discount":        discountPercentage > 0,
+	}
+}
+

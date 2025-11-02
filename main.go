@@ -217,6 +217,7 @@ func main() {
 			products.GET("/", handlers.GetProducts)
 			products.GET("/:id", handlers.GetProduct)
 			products.GET("/:id/similar", handlers.GetSimilarProducts)
+			products.GET("/:id/suggestions", handlers.GetProductSuggestions)
 			products.GET("/search", handlers.SearchProductByCode)
 			products.GET("/brand/:brandId", handlers.GetProductsByBrand)
 			products.POST("/", handlers.CreateProduct)
@@ -227,6 +228,7 @@ func main() {
 			products.POST("/:id/view", handlers.RegisterProductView)
 			products.GET("/most-viewed", handlers.GetMostViewedProducts)
 			products.GET("/most-viewed/category/:categoryId", handlers.GetMostViewedProductsByCategory)
+			products.GET("/recently-viewed", handlers.AuthMiddleware(), handlers.GetUserRecentlyViewedProducts)
 		}
 
 		// Category routes
