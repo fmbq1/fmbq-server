@@ -396,6 +396,14 @@ func main() {
 		api.GET("/quartiers/:id/delivery-fee", handlers.GetQuartierDeliveryFee)
 		api.GET("/quartiers/city/:cityId", handlers.GetQuartiersByCity)
 		api.GET("/quartiers", handlers.GetAllQuartiers)
+		
+		// Public Melhaf routes
+		api.GET("/melhaf/videos", handlers.GetMelhafVideos)
+		api.GET("/melhaf/colors/:id", handlers.GetMelhafColorDetails)
+		
+		// Public Maison Adrar routes
+		api.GET("/maison-adrar/feed", handlers.GetMaisonAdrarFeed)
+		api.GET("/maison-adrar/banners", handlers.GetMaisonAdrarBanners)
 			
 			// Payment methods management
 			admin.GET("/payment-methods", handlers.GetPaymentMethods)
@@ -420,6 +428,33 @@ func main() {
 		admin.POST("/backgrounds/upload-image", handlers.UploadBackgroundImage)
 		admin.GET("/backgrounds/stats", handlers.GetBackgroundStats)
 		admin.GET("/backgrounds/check-schema", handlers.CheckBackgroundSchema)
+		
+		// Melhaf management routes
+		admin.GET("/melhaf/types", handlers.AdminGetMelhafTypes)
+		admin.POST("/melhaf/types", handlers.AdminCreateMelhafType)
+		admin.GET("/melhaf/collections", handlers.AdminGetMelhafCollections)
+		admin.GET("/melhaf/collections/:id", handlers.AdminGetMelhafCollection)
+		admin.POST("/melhaf/collections", handlers.AdminCreateMelhafCollection)
+		admin.PUT("/melhaf/collections/:id", handlers.AdminUpdateMelhafCollection)
+		admin.GET("/melhaf/colors", handlers.AdminGetMelhafColors)
+		admin.POST("/melhaf/colors", handlers.AdminCreateMelhafColor)
+		admin.POST("/melhaf/colors/:id/images", handlers.AdminUploadMelhafImage)
+		admin.POST("/melhaf/videos", handlers.AdminUploadMelhafVideo)
+		admin.PUT("/melhaf/colors/:id/inventory", handlers.AdminUpdateMelhafInventory)
+		
+		// Maison Adrar management routes
+		admin.GET("/maison-adrar/categories", handlers.AdminGetMaisonAdrarCategories)
+		admin.POST("/maison-adrar/categories", handlers.AdminCreateMaisonAdrarCategory)
+		admin.GET("/maison-adrar/collections", handlers.AdminGetMaisonAdrarCollections)
+		admin.GET("/maison-adrar/collections/:id", handlers.AdminGetMaisonAdrarCollection)
+		admin.POST("/maison-adrar/collections", handlers.AdminCreateMaisonAdrarCollection)
+		admin.PUT("/maison-adrar/collections/:id", handlers.AdminUpdateMaisonAdrarCollection)
+		admin.POST("/maison-adrar/collections/:id/background", handlers.AdminUploadMaisonAdrarBackground)
+		admin.POST("/maison-adrar/collections/:id/banner", handlers.AdminUploadMaisonAdrarBanner)
+		admin.POST("/maison-adrar/collections/:id/perfumes", handlers.AdminCreateMaisonAdrarPerfume)
+		admin.POST("/maison-adrar/perfumes/:id/images", handlers.AdminUploadMaisonAdrarPerfumeImage)
+		admin.GET("/maison-adrar/banners", handlers.AdminGetMaisonAdrarBanners)
+		admin.POST("/maison-adrar/banners", handlers.AdminCreateMaisonAdrarBanner)
 		}
 
 		// Admin POS routes (protected with admin or employee)

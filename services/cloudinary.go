@@ -184,6 +184,155 @@ func ExtractPublicID(url string) string {
 	return ""
 }
 
+// UploadVideo uploads a video file to Cloudinary
+func (cs *CloudinaryService) UploadVideo(file multipart.File, folder string) (*uploader.UploadResult, error) {
+	ctx := context.Background()
+	
+	// Generate unique public ID
+	publicID := fmt.Sprintf("%s/%d", folder, time.Now().UnixNano())
+	
+	result, err := cs.cld.Upload.Upload(ctx, file, uploader.UploadParams{
+		PublicID: publicID,
+		Folder:   folder,
+		UseFilename: &[]bool{true}[0],
+		UniqueFilename: &[]bool{true}[0],
+		Overwrite: &[]bool{false}[0],
+		ResourceType: "video",
+	})
+	
+	if err != nil {
+		return nil, fmt.Errorf("failed to upload video: %w", err)
+	}
+	
+	// Normalize URLs to HTTPS
+	if result != nil {
+		if result.URL != "" {
+			result.URL = forceHTTPS(result.URL)
+		}
+		if result.SecureURL != "" {
+			result.SecureURL = forceHTTPS(result.SecureURL)
+		} else if result.URL != "" {
+			result.SecureURL = forceHTTPS(result.URL)
+		}
+	}
+
+	return result, nil
+}
+
+// Helper functions for handlers to use directly with multipart.FileHeader
+func UploadImageToCloudinary(fileHeader *multipart.FileHeader) (string, error) {
+	if Cloudinary == nil {
+		return "", fmt.Errorf("Cloudinary not initialized")
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	result, err := Cloudinary.UploadImage(file, "melhaf_images")
+	if err != nil {
+		return "", err
+	}
+
+	if result.SecureURL != "" {
+		return result.SecureURL, nil
+	}
+	return result.URL, nil
+}
+
+func UploadVideoToCloudinary(fileHeader *multipart.FileHeader) (string, error) {
+	if Cloudinary == nil {
+		return "", fmt.Errorf("Cloudinary not initialized")
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	result, err := Cloudinary.UploadVideo(file, "melhaf_videos")
+	if err != nil {
+		return "", err
+	}
+
+	if result.SecureURL != "" {
+		return result.SecureURL, nil
+	}
+	return result.URL, nil
+}
+
+// UploadMaisonAdrarPerfumeImage uploads an image to Cloudinary for Maison Adrar perfumes
+func UploadMaisonAdrarPerfumeImage(fileHeader *multipart.FileHeader) (string, error) {
+	if Cloudinary == nil {
+		return "", fmt.Errorf("Cloudinary not initialized")
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	result, err := Cloudinary.UploadImage(file, "maison_adrar_perfumes")
+	if err != nil {
+		return "", err
+	}
+
+	if result.SecureURL != "" {
+		return result.SecureURL, nil
+	}
+	return result.URL, nil
+}
+
+// UploadMaisonAdrarBackground uploads a background image to Cloudinary for Maison Adrar collections
+func UploadMaisonAdrarBackground(fileHeader *multipart.FileHeader) (string, error) {
+	if Cloudinary == nil {
+		return "", fmt.Errorf("Cloudinary not initialized")
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	result, err := Cloudinary.UploadImage(file, "maison_adrar_backgrounds")
+	if err != nil {
+		return "", err
+	}
+
+	if result.SecureURL != "" {
+		return result.SecureURL, nil
+	}
+	return result.URL, nil
+}
+
+// UploadMaisonAdrarBanner uploads a banner image to Cloudinary for Maison Adrar
+func UploadMaisonAdrarBanner(fileHeader *multipart.FileHeader) (string, error) {
+	if Cloudinary == nil {
+		return "", fmt.Errorf("Cloudinary not initialized")
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		return "", fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	result, err := Cloudinary.UploadImage(file, "maison_adrar_banners")
+	if err != nil {
+		return "", err
+	}
+
+	if result.SecureURL != "" {
+		return result.SecureURL, nil
+	}
+	return result.URL, nil
+}
+
 // forceHTTPS ensures Cloudinary URLs use https scheme
 func forceHTTPS(in string) string {
     if in == "" {

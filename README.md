@@ -196,11 +196,11 @@ The server automatically creates all necessary tables on startup. The initializa
 go run main.go
 ```
 
-The server will run on `http://192.168.100.9:8080` by default.
+The server will run on `http://192.168.100.10:8080` by default.
 
 ### Health Check
 
-Visit `http://192.168.100.9:8080/health` to check if the server is running.
+Visit `http://192.168.100.10:8080/health` to check if the server is running.
 
 ## Production Deployment
 

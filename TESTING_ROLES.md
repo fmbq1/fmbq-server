@@ -12,7 +12,7 @@
 
 ```bash
 # Using the admin signup endpoint
-curl -X POST http://192.168.100.9:8080/admin/signup \
+curl -X POST http://192.168.100.10:8080/admin/signup \
   -H "Content-Type: application/json" \
   -d '{
     "phone": "+22212345678",
@@ -24,13 +24,13 @@ curl -X POST http://192.168.100.9:8080/admin/signup \
 
 ### 2. Login as Admin
 
-1. Go to `http://192.168.100.9:3000/admin/login`
+1. Go to `http://192.168.100.10:3000/admin/login`
 2. Enter the admin credentials
 3. You should be redirected to the admin dashboard
 
 ### 3. Test Users Management
 
-1. Navigate to `http://192.168.100.9:3000/admin/users`
+1. Navigate to `http://192.168.100.10:3000/admin/users`
 2. You should see the users management page
 3. Check browser console for any errors
 4. The page should show:
@@ -49,15 +49,15 @@ curl -X POST http://192.168.100.9:8080/admin/signup \
 
 ```bash
 # Get all users (requires admin token)
-curl -X GET http://192.168.100.9:8080/api/v1/admin/users \
+curl -X GET http://192.168.100.10:8080/api/v1/admin/users \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
 
 # Get user statistics
-curl -X GET http://192.168.100.9:8080/api/v1/admin/users-stats \
+curl -X GET http://192.168.100.10:8080/api/v1/admin/users-stats \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN"
 
 # Update user role
-curl -X PUT http://192.168.100.9:8080/api/v1/admin/users/USER_ID/role \
+curl -X PUT http://192.168.100.10:8080/api/v1/admin/users/USER_ID/role \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"role": "employee"}'

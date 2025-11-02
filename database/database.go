@@ -68,7 +68,20 @@ func (db *DB) InitializeTables() error {
 		// Payment models
 		models.PaymentMethod{},
 		models.Banner{},
-	models.Background{},
+		models.Background{},
+		// Melhaf models
+		models.MelhafType{},
+		models.MelhafCollection{},
+		models.MelhafColor{},
+		models.MelhafColorImage{},
+		models.MelhafVideo{},
+		models.MelhafInventory{},
+		// Maison Adrar models
+		models.MaisonAdrarCategory{},
+		models.MaisonAdrarCollection{},
+		models.MaisonAdrarPerfume{},
+		models.MaisonAdrarPerfumeImage{},
+		models.MaisonAdrarBanner{},
 	}
 
 	for _, model := range models {
@@ -115,6 +128,10 @@ func (db *DB) runMigrations() error {
 		`ALTER TABLE cities ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT now();`,
 		`ALTER TABLE quartiers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT now();`,
 		`ALTER TABLE quartiers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT now();`,
+		
+		// Add background_color and banner_url columns to maison_adrar_collections if they don't exist
+		`ALTER TABLE maison_adrar_collections ADD COLUMN IF NOT EXISTS background_color TEXT;`,
+		`ALTER TABLE maison_adrar_collections ADD COLUMN IF NOT EXISTS banner_url TEXT;`,
 		
 		
 		// Create address book tables
