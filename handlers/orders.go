@@ -32,15 +32,16 @@ func CreateOrder(c *gin.Context) {
 	}
 	fmt.Printf("👤 User ID: %s\n", userID)
 
-	var request struct {
-		Items []struct {
-			ProductID string  `json:"product_id" binding:"required"`
-			SKUID     string  `json:"sku_id" binding:"required"`
-			Quantity  int     `json:"quantity" binding:"required,min=1"`
-			Price     float64 `json:"price" binding:"required"`
-			Size      *string `json:"size"`
-			Color     *string `json:"color"`
-		} `json:"items" binding:"required"`
+    var request struct {
+        Items []struct {
+            ProductID string  `json:"product_id"`
+            SKUID     string  `json:"sku_id"`
+            Quantity  int     `json:"quantity" binding:"required,min=1"`
+            Price     float64 `json:"price" binding:"required"`
+            Size      *string `json:"size"`
+            Color     *string `json:"color"`
+            MaisonAdrarColorID *string `json:"maison_adrar_color_id"`
+        } `json:"items" binding:"required"`
 		DeliveryAddress struct {
 			AddressID  string   `json:"address_id" binding:"required"`
 			City       string   `json:"city" binding:"required"`
@@ -150,11 +151,76 @@ func CreateOrder(c *gin.Context) {
 
 	// Create order items and update inventory
 	var orderItems []map[string]interface{}
-	for _, item := range request.Items {
-		fmt.Printf("Processing order item: ProductID=%s, SKUID=%s, Quantity=%d\n", 
-			item.ProductID, item.SKUID, item.Quantity)
+    for _, item := range request.Items {
+        fmt.Printf("Processing order item: ProductID=%s, SKUID=%s, Quantity=%d, MA_ColorID=%v\n", 
+            item.ProductID, item.SKUID, item.Quantity, item.MaisonAdrarColorID)
 		
-		// Validate product and SKU
+        // Maison Adrar perfume color handling (no SKU path)
+        if item.MaisonAdrarColorID != nil && *item.MaisonAdrarColorID != "" {
+            candidateUUID, err := uuid.Parse(*item.MaisonAdrarColorID)
+            if err != nil {
+                c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid maison_adrar_color_id"})
+                return
+            }
+
+            // First, try treating provided ID as a color ID
+            var stock int
+            colorUUID := candidateUUID
+            err = tx.QueryRow(`SELECT COALESCE(stock,0) FROM maison_adrar_perfume_colors WHERE id = $1`, colorUUID).Scan(&stock)
+            if err == sql.ErrNoRows {
+                // Fallback: treat provided ID as a perfume ID and pick a variant (highest stock)
+                var fallbackColor uuid.UUID
+                var fallbackStock int
+                q := `SELECT id, COALESCE(stock,0) FROM maison_adrar_perfume_colors WHERE perfume_id = $1 ORDER BY COALESCE(stock,0) DESC, sort_order ASC LIMIT 1`
+                if err2 := tx.QueryRow(q, candidateUUID).Scan(&fallbackColor, &fallbackStock); err2 == nil {
+                    colorUUID = fallbackColor
+                    stock = fallbackStock
+                } else {
+                    c.JSON(http.StatusBadRequest, gin.H{"error": "Perfume color not found for given perfume"})
+                    return
+                }
+            } else if err != nil {
+                c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check perfume stock"})
+                return
+            }
+            if stock < item.Quantity {
+                c.JSON(http.StatusBadRequest, gin.H{"error": "Insufficient perfume stock", "available": stock, "requested": item.Quantity})
+                return
+            }
+            res, err := tx.Exec(`UPDATE maison_adrar_perfume_colors SET stock = stock - $1, updated_at = now() WHERE id = $2 AND stock >= $1`, item.Quantity, colorUUID)
+            if err != nil {
+                c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update perfume stock"})
+                return
+            }
+            if rows, _ := res.RowsAffected(); rows == 0 {
+                c.JSON(http.StatusBadRequest, gin.H{"error": "Insufficient perfume stock"})
+                return
+            }
+
+            // Create order item, store color id in color field for traceability
+            orderItemID := uuid.New()
+            totalPrice := item.Price * float64(item.Quantity)
+            _, err = tx.Exec(`
+                INSERT INTO order_items (id, order_id, product_id, sku_id, quantity, unit_price, total_price, size, color, created_at)
+                VALUES ($1,$2,NULL,NULL,$3,$4,$5,$6,$7, now())
+            `, orderItemID, orderID, item.Quantity, item.Price, totalPrice, item.Size, item.MaisonAdrarColorID)
+            if err != nil {
+                c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create order item"})
+                return
+            }
+            orderItems = append(orderItems, map[string]interface{}{
+                "id": orderItemID.String(),
+                "quantity": item.Quantity,
+                "unit_price": item.Price,
+                "total_price": totalPrice,
+                "size": item.Size,
+                "color": item.MaisonAdrarColorID,
+                "brand_name": "Maison Adrar",
+            })
+            continue
+        }
+
+        // Validate product and SKU
 		productID, err := uuid.Parse(item.ProductID)
 		if err != nil {
 			fmt.Printf("Invalid product ID: %s\n", item.ProductID)

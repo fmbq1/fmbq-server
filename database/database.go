@@ -82,6 +82,9 @@ func (db *DB) InitializeTables() error {
 		models.MaisonAdrarPerfume{},
 		models.MaisonAdrarPerfumeImage{},
 		models.MaisonAdrarBanner{},
+		models.FeedBlock{},
+		models.FeedBlockItem{},
+		models.Campaign{},
 	}
 
 	for _, model := range models {
@@ -132,6 +135,32 @@ func (db *DB) runMigrations() error {
 		// Add background_color and banner_url columns to maison_adrar_collections if they don't exist
 		`ALTER TABLE maison_adrar_collections ADD COLUMN IF NOT EXISTS background_color TEXT;`,
 		`ALTER TABLE maison_adrar_collections ADD COLUMN IF NOT EXISTS banner_url TEXT;`,
+
+    // Ensure base Maison Adrar perfume columns exist (older DBs may miss some)
+    `ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS type TEXT;`,
+    `ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS size TEXT;`,
+    `ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS description TEXT;`,
+    `ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS ingredients TEXT;`,
+    `ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS discount NUMERIC(5,2);`,
+    `ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS ean TEXT;`,
+    `ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;`,
+    `ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0;`,
+
+    // Extend Maison Adrar perfumes with richer schema
+		`ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS gender_category TEXT;`,
+		`ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS concentration TEXT;`,
+		`ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS fragrance_family TEXT;`,
+		`ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS top_notes TEXT;`,
+		`ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS middle_notes TEXT;`,
+		`ALTER TABLE maison_adrar_perfumes ADD COLUMN IF NOT EXISTS base_notes TEXT;`,
+
+		// Extend perfume images
+		`ALTER TABLE maison_adrar_perfume_images ADD COLUMN IF NOT EXISTS is_main BOOLEAN DEFAULT FALSE;`,
+
+		// Extend perfume colors as variants
+		`ALTER TABLE maison_adrar_perfume_colors ADD COLUMN IF NOT EXISTS price_override NUMERIC(12,2);`,
+		`ALTER TABLE maison_adrar_perfume_colors ADD COLUMN IF NOT EXISTS volume_ml INTEGER;`,
+		`ALTER TABLE maison_adrar_perfume_colors ADD COLUMN IF NOT EXISTS stock INTEGER;`,
 		
 		
 		// Create address book tables

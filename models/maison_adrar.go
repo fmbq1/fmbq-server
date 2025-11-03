@@ -85,6 +85,13 @@ type MaisonAdrarPerfume struct {
 	Price        float64   `json:"price" db:"price"`
 	Discount     *float64  `json:"discount" db:"discount"`            // Optional discount percentage
 	EAN          *string   `json:"ean" db:"ean"`                      // EAN code for barcode
+	// Extended fields to match high-quality schema
+	GenderCategory   *string `json:"gender_category" db:"gender_category"`       // Men/Women/Unisex
+	Concentration    *string `json:"concentration" db:"concentration"`           // EDP/EDT/Parfum
+	FragranceFamily  *string `json:"fragrance_family" db:"fragrance_family"`     // Woody/Floral
+	TopNotes         *string `json:"top_notes" db:"top_notes"`                   // JSON string or text
+	MiddleNotes      *string `json:"middle_notes" db:"middle_notes"`
+	BaseNotes        *string `json:"base_notes" db:"base_notes"`
 	IsActive     bool      `json:"is_active" db:"is_active"`
 	SortOrder    int       `json:"sort_order" db:"sort_order"`
 	CreatedAt    time.Time `json:"created_at" db:"created_at"`
@@ -109,6 +116,12 @@ func (MaisonAdrarPerfume) CreateTableSQL() string {
 		price NUMERIC(12,2) NOT NULL DEFAULT 0,
 		discount NUMERIC(5,2),
 		ean TEXT,
+		gender_category TEXT,
+		concentration TEXT,
+		fragrance_family TEXT,
+		top_notes TEXT,
+		middle_notes TEXT,
+		base_notes TEXT,
 		is_active BOOLEAN DEFAULT TRUE,
 		sort_order INTEGER DEFAULT 0,
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
@@ -120,10 +133,14 @@ func (MaisonAdrarPerfume) CreateTableSQL() string {
 type MaisonAdrarPerfumeColor struct {
 	ID         uuid.UUID `json:"id" db:"id"`
 	PerfumeID  uuid.UUID `json:"perfume_id" db:"perfume_id"`
-	Name       string    `json:"name" db:"name"`
+	// Treat as variant
+	Name       string    `json:"name" db:"name"`              // color_name / edition name
 	NameAr     *string   `json:"name_ar" db:"name_ar"`
-	ColorCode  *string   `json:"color_code" db:"color_code"` // Hex color code
-	Price      float64   `json:"price" db:"price"`            // Override perfume price if different
+	ColorCode  *string   `json:"color_code" db:"color_code"`  // hex_color
+	Price      float64   `json:"price" db:"price"`            // base price / legacy
+	PriceOverride *float64 `json:"price_override" db:"price_override"`
+	VolumeML   *int      `json:"volume_ml" db:"volume_ml"`
+	Stock      *int      `json:"stock" db:"stock"`
 	Discount   *float64  `json:"discount" db:"discount"`
 	IsActive   bool      `json:"is_active" db:"is_active"`
 	SortOrder  int       `json:"sort_order" db:"sort_order"`
@@ -144,6 +161,9 @@ func (MaisonAdrarPerfumeColor) CreateTableSQL() string {
 		name_ar TEXT,
 		color_code TEXT,
 		price NUMERIC(12,2) NOT NULL DEFAULT 0,
+		price_override NUMERIC(12,2),
+		volume_ml INTEGER,
+		stock INTEGER,
 		discount NUMERIC(5,2),
 		is_active BOOLEAN DEFAULT TRUE,
 		sort_order INTEGER DEFAULT 0,
@@ -159,6 +179,7 @@ type MaisonAdrarPerfumeImage struct {
 	URL        string    `json:"url" db:"url"`
 	Alt        *string   `json:"alt" db:"alt"`
 	Position   int       `json:"position" db:"position"`
+	IsMain     bool      `json:"is_main" db:"is_main"`
 	CreatedAt  time.Time `json:"created_at" db:"created_at"`
 }
 
@@ -174,9 +195,81 @@ func (MaisonAdrarPerfumeImage) CreateTableSQL() string {
 		url TEXT NOT NULL,
 		alt TEXT,
 		position INTEGER DEFAULT 0,
+		is_main BOOLEAN DEFAULT FALSE,
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 	);`
 }
+
+// Feed blocks (Zalando/FashionNova style)
+type FeedBlock struct {
+    ID        uuid.UUID `json:"id" db:"id"`
+    Type      string    `json:"type" db:"type"` // banner, carousel, grid, story, video_section
+    Title     *string   `json:"title" db:"title"`
+    Subtitle  *string   `json:"subtitle" db:"subtitle"`
+    BackgroundImageURL *string `json:"background_image_url" db:"background_image_url"`
+    CTALabel  *string   `json:"cta_label" db:"cta_label"`
+    CTAAction *string   `json:"cta_action" db:"cta_action"` // JSON
+    Position  int       `json:"position" db:"position"`
+    CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+func (FeedBlock) TableName() string { return "feed_blocks" }
+func (FeedBlock) CreateTableSQL() string {
+    return `
+    CREATE TABLE IF NOT EXISTS feed_blocks (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        type VARCHAR(50) NOT NULL,
+        title VARCHAR(255),
+        subtitle VARCHAR(255),
+        background_image_url TEXT,
+        cta_label VARCHAR(100),
+        cta_action JSONB,
+        position INTEGER DEFAULT 0,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    );`
+}
+
+type FeedBlockItem struct {
+    ID          uuid.UUID `json:"id" db:"id"`
+    FeedBlockID uuid.UUID `json:"feed_block_id" db:"feed_block_id"`
+    PerfumeID   uuid.UUID `json:"perfume_id" db:"perfume_id"`
+    CustomImageURL *string `json:"custom_image_url" db:"custom_image_url"`
+    HighlightText *string `json:"highlight_text" db:"highlight_text"`
+    Position    int       `json:"position" db:"position"`
+}
+
+func (FeedBlockItem) TableName() string { return "feed_block_items" }
+func (FeedBlockItem) CreateTableSQL() string {
+    return `
+    CREATE TABLE IF NOT EXISTS feed_block_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        feed_block_id UUID NOT NULL REFERENCES feed_blocks(id) ON DELETE CASCADE,
+        perfume_id UUID NOT NULL REFERENCES maison_adrar_perfumes(id) ON DELETE CASCADE,
+        custom_image_url TEXT,
+        highlight_text VARCHAR(255),
+        position INTEGER DEFAULT 0
+    );`
+}
+
+type Campaign struct {
+    ID           uuid.UUID `json:"id" db:"id"`
+    Name         string    `json:"name" db:"name"`
+    Tagline      *string   `json:"tagline" db:"tagline"`
+    StartDate    *time.Time `json:"start_date" db:"start_date"`
+    EndDate      *time.Time `json:"end_date" db:"end_date"`
+    HeroImageURL *string   `json:"hero_image_url" db:"hero_image_url"`
+}
+
+func (Campaign) TableName() string { return "campaigns" }
+func (Campaign) CreateTableSQL() string { return `
+CREATE TABLE IF NOT EXISTS campaigns (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    tagline TEXT,
+    start_date DATE,
+    end_date DATE,
+    hero_image_url TEXT
+);` }
 
 // MaisonAdrarBanner represents banners for the perfume feed
 type MaisonAdrarBanner struct {

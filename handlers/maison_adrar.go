@@ -438,8 +438,25 @@ func AdminCreateMaisonAdrarCollection(c *gin.Context) {
 			Ingredients *string  `json:"ingredients"` // Ingredients list
 			Price       float64  `json:"price" binding:"required"`
 			Discount    *float64 `json:"discount"`
+			// Extended fields
+			GenderCategory  *string `json:"gender_category"`
+			Concentration   *string `json:"concentration"`
+			FragranceFamily *string `json:"fragrance_family"`
+			TopNotes        *string `json:"top_notes"`
+			MiddleNotes     *string `json:"middle_notes"`
+			BaseNotes       *string `json:"base_notes"`
 			SortOrder   int      `json:"sort_order"`
 			IsActive    bool     `json:"is_active"`
+			Images      []string `json:"images"`
+			Variants    []struct {
+				ColorName     *string `json:"color_name"`
+				HexColor      *string `json:"hex_color"`
+				VolumeML      *int    `json:"volume_ml"`
+				PriceOverride *float64 `json:"price_override"`
+				Stock         *int    `json:"stock"`
+				SortOrder     int     `json:"sort_order"`
+				IsActive      bool    `json:"is_active"`
+			} `json:"variants"`
 		} `json:"perfumes" binding:"required,min=1"`
 	}
 
@@ -473,10 +490,11 @@ func AdminCreateMaisonAdrarCollection(c *gin.Context) {
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
 	`, collectionID, categoryUUID, req.Name, req.Description, req.BackgroundColor, req.BackgroundURL, req.BannerURL, req.IsActive, req.SortOrder)
 
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create collection"})
-		return
-	}
+    if err != nil {
+        fmt.Printf("[AdminCreateMaisonAdrarCollection] insert collection error: %v\n", err)
+        c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create collection: %v", err)})
+        return
+    }
 
 	// Create perfumes
 	var createdPerfumes []map[string]interface{}
@@ -484,13 +502,41 @@ func AdminCreateMaisonAdrarCollection(c *gin.Context) {
 		perfumeID := uuid.New()
 
 		_, err = tx.Exec(`
-			INSERT INTO maison_adrar_perfumes (id, collection_id, name, name_ar, type, size, description, ingredients, price, discount, is_active, sort_order, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
-		`, perfumeID, collectionID, perfumeData.Name, perfumeData.NameAr, perfumeData.Type, perfumeData.Size, perfumeData.Description, perfumeData.Ingredients, perfumeData.Price, perfumeData.Discount, perfumeData.IsActive, perfumeData.SortOrder)
+			INSERT INTO maison_adrar_perfumes (
+				id, collection_id, name, name_ar, type, size, description, ingredients, price, discount,
+				gender_category, concentration, fragrance_family, top_notes, middle_notes, base_notes,
+				is_active, sort_order, created_at, updated_at)
+			VALUES (
+				$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+				$11,$12,$13,$14,$15,$16,
+				$17,$18, now(), now())
+		`, perfumeID, collectionID, perfumeData.Name, perfumeData.NameAr, perfumeData.Type, perfumeData.Size, perfumeData.Description, perfumeData.Ingredients, perfumeData.Price, perfumeData.Discount,
+			perfumeData.GenderCategory, perfumeData.Concentration, perfumeData.FragranceFamily, perfumeData.TopNotes, perfumeData.MiddleNotes, perfumeData.BaseNotes,
+			perfumeData.IsActive, perfumeData.SortOrder)
 
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create perfume: " + perfumeData.Name})
-			return
+        if err != nil {
+            fmt.Printf("[AdminCreateMaisonAdrarCollection] insert perfume '%s' error: %v\n", perfumeData.Name, err)
+            c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create perfume '%s': %v", perfumeData.Name, err)})
+            return
+        }
+
+		// Insert images
+		for idx, img := range perfumeData.Images {
+			if img == "" { continue }
+			imgID := uuid.New()
+			_, _ = tx.Exec(`
+				INSERT INTO maison_adrar_perfume_images (id, perfume_id, url, position, is_main, created_at)
+				VALUES ($1, $2, $3, $4, $5, now())
+			`, imgID, perfumeID, img, idx, idx == 0)
+		}
+
+		// Insert variants (map to color table)
+		for _, v := range perfumeData.Variants {
+			variantID := uuid.New()
+			_, _ = tx.Exec(`
+				INSERT INTO maison_adrar_perfume_colors (id, perfume_id, name, color_code, price_override, volume_ml, stock, discount, is_active, sort_order, created_at, updated_at)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,NULL,$8,$9, now(), now())
+			`, variantID, perfumeID, v.ColorName, v.HexColor, v.PriceOverride, v.VolumeML, v.Stock, v.IsActive, v.SortOrder)
 		}
 
 		createdPerfumes = append(createdPerfumes, map[string]interface{}{
