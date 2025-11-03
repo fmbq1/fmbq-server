@@ -161,10 +161,20 @@ func AdminGetMaisonAdrarCollections(c *gin.Context) {
 			descriptionStr = &description.String
 		}
 
+		var categoryIDStr *string
+		if categoryID.Valid {
+			categoryIDStr = &categoryID.String
+		}
+
+		var categoryNameStr *string
+		if categoryName.Valid {
+			categoryNameStr = &categoryName.String
+		}
+
 		collections = append(collections, map[string]interface{}{
 			"id":               id.String(),
-			"category_id":      categoryID.String,
-			"category_name":    categoryName.String,
+			"category_id":      categoryIDStr,
+			"category_name":    categoryNameStr,
 			"name":             name,
 			"description":      descriptionStr,
 			"background_color": backgroundColorStr,

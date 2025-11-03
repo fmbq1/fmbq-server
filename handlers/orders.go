@@ -169,6 +169,151 @@ func CreateOrder(c *gin.Context) {
 			return
 		}
 
+		// Check if this is a Melhaf item (same ID used for product and SKU in Melhaf)
+		var isMelhaf bool
+		var melhafColorExists bool
+		err = tx.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM melhaf_colors 
+				WHERE id = $1 AND is_active = true
+			)`, productID).Scan(&melhafColorExists)
+		
+		if err == nil && melhafColorExists && productID == skuID {
+			isMelhaf = true
+			fmt.Printf("✅ Detected Melhaf item: ColorID=%s\n", productID)
+		}
+
+		// Handle Melhaf items differently
+		if isMelhaf {
+			// Check Melhaf inventory
+			var currentQuantity int
+			var reservedQuantity int
+			err = tx.QueryRow(`
+				SELECT COALESCE(available, 0), COALESCE(reserved, 0) 
+				FROM melhaf_inventory 
+				WHERE color_id = $1`, productID).Scan(&currentQuantity, &reservedQuantity)
+			
+			if err != nil {
+				if err == sql.ErrNoRows {
+					fmt.Printf("❌ No Melhaf inventory found for ColorID=%s\n", productID)
+					c.JSON(http.StatusBadRequest, gin.H{
+						"error": "No inventory found for this Melhaf color",
+						"product_id": item.ProductID,
+					})
+					return
+				}
+				fmt.Printf("❌ Error checking Melhaf inventory: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check Melhaf inventory"})
+				return
+			}
+
+			fmt.Printf("📦 Melhaf inventory: ColorID=%s, Available=%d, Reserved=%d, Requested=%d\n", 
+				productID, currentQuantity, reservedQuantity, item.Quantity)
+
+			if currentQuantity < item.Quantity {
+				fmt.Printf("❌ Insufficient Melhaf quantity: Available=%d, Requested=%d\n", currentQuantity, item.Quantity)
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "Insufficient quantity available for this Melhaf color",
+					"product_id": item.ProductID,
+					"available": currentQuantity,
+					"requested": item.Quantity,
+				})
+				return
+			}
+
+			// Update Melhaf inventory
+			fmt.Printf("🔄 Updating Melhaf inventory: ColorID=%s, reducing by %d\n", productID, item.Quantity)
+			result, err := tx.Exec(`
+				UPDATE melhaf_inventory 
+				SET available = available - $1, updated_at = $2
+				WHERE color_id = $3 AND available >= $1`, item.Quantity, now, productID)
+			
+			if err != nil {
+				fmt.Printf("❌ Failed to update Melhaf inventory: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update Melhaf inventory"})
+				return
+			}
+			
+			rowsAffected, err := result.RowsAffected()
+			if err != nil {
+				fmt.Printf("❌ Failed to get rows affected: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify Melhaf inventory update"})
+				return
+			}
+			
+			fmt.Printf("✅ Melhaf inventory updated: %d rows affected\n", rowsAffected)
+			
+			if rowsAffected == 0 {
+				fmt.Printf("❌ No rows affected in Melhaf inventory update\n")
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "Insufficient Melhaf inventory",
+					"product_id": item.ProductID,
+				})
+				return
+			}
+
+			// Create order item for Melhaf (use NULL for product_id since it's not in product_models)
+			orderItemID := uuid.New()
+			fmt.Printf("🆔 Creating Melhaf order item: ID=%s, OrderID=%s, ColorID=%s\n", 
+				orderItemID, orderID, productID)
+			
+			// Get Melhaf color details
+			var melhafName, collectionName sql.NullString
+			var melhafPrice float64
+			err = tx.QueryRow(`
+				SELECT mc.name, mc.price, mcol.name as collection_name
+				FROM melhaf_colors mc
+				JOIN melhaf_collections mcol ON mc.collection_id = mcol.id
+				WHERE mc.id = $1`, productID).Scan(&melhafName, &melhafPrice, &collectionName)
+			
+			if err != nil {
+				fmt.Printf("❌ Failed to get Melhaf color details: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get Melhaf color details"})
+				return
+			}
+
+			// Insert order item with NULL product_id for Melhaf items
+			// We'll store the Melhaf color ID in sku_id field
+			orderItemQuery := `
+				INSERT INTO order_items (
+					id, order_id, product_id, sku_id, quantity, 
+					unit_price, total_price, size, color, created_at
+				) VALUES ($1, $2, NULL, $3, $4, $5, $6, NULL, $7, $8)`
+
+			totalPrice := item.Price * float64(item.Quantity)
+			fmt.Printf("💰 Melhaf order item prices: Unit=%.2f, Quantity=%d, Total=%.2f\n", 
+				item.Price, item.Quantity, totalPrice)
+
+			_, err = tx.Exec(orderItemQuery,
+				orderItemID, orderID, productID, item.Quantity, // Use Melhaf color ID as sku_id (productID), quantity as $4
+				item.Price, totalPrice, melhafName.String, now,
+			)
+
+			if err != nil {
+				fmt.Printf("❌ Failed to create Melhaf order item: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create Melhaf order item"})
+				return
+			}
+			
+			fmt.Printf("✅ Melhaf order item created successfully\n")
+
+			// Add to order items response
+			orderItems = append(orderItems, map[string]interface{}{
+				"id":           orderItemID.String(),
+				"product_id":   nil, // NULL for Melhaf
+				"sku_id":       productID.String(),
+				"quantity":     item.Quantity,
+				"unit_price":   item.Price,
+				"total_price":  totalPrice,
+				"product_name": fmt.Sprintf("%s - %s", collectionName.String, melhafName.String),
+				"brand_name":   "Melhaf",
+				"color":        melhafName.String,
+			})
+			
+			continue // Skip regular product processing
+		}
+
+		// Regular product processing
 		// Check if product exists and is active
 		var productExists bool
 		err = tx.QueryRow(`
