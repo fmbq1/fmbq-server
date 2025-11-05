@@ -115,7 +115,7 @@ VALUES (gen_random_uuid(), 'admin@example.com', 'Admin User', 'admin', true);
 ### Updating User Role via API
 
 ```bash
-curl -X PUT https://fmbq-server.onrender.com/api/v1/admin/users/{user_id}/role \
+curl -X PUT http://192.168.0.131:8080/api/v1/admin/users/{user_id}/role \
   -H "Authorization: Bearer {admin_token}" \
   -H "Content-Type: application/json" \
   -d '{"role": "employee"}'

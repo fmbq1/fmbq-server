@@ -338,22 +338,26 @@ func CreateOrder(c *gin.Context) {
 				return
 			}
 
-			// Insert order item with NULL product_id for Melhaf items
-			// We'll store the Melhaf color ID in sku_id field
-			orderItemQuery := `
-				INSERT INTO order_items (
-					id, order_id, product_id, sku_id, quantity, 
-					unit_price, total_price, size, color, created_at
-				) VALUES ($1, $2, NULL, $3, $4, $5, $6, NULL, $7, $8)`
+            // Insert order item for Melhaf items:
+            // - product_id: NULL (not part of product_models)
+            // - sku_id: NULL (avoid FK to skus)
+            // - store melhaf color name in color field
+            orderItemQuery := `
+                INSERT INTO order_items (
+                    id, order_id, product_id, sku_id, quantity,
+                    unit_price, total_price, size, color, created_at
+                ) VALUES ($1, $2, NULL, NULL, $3, $4, $5, NULL, $6, $7)`
 
 			totalPrice := item.Price * float64(item.Quantity)
 			fmt.Printf("💰 Melhaf order item prices: Unit=%.2f, Quantity=%d, Total=%.2f\n", 
 				item.Price, item.Quantity, totalPrice)
 
-			_, err = tx.Exec(orderItemQuery,
-				orderItemID, orderID, productID, item.Quantity, // Use Melhaf color ID as sku_id (productID), quantity as $4
-				item.Price, totalPrice, melhafName.String, now,
-			)
+            _, err = tx.Exec(orderItemQuery,
+                orderItemID, orderID,
+                item.Quantity,
+                item.Price, totalPrice,
+                melhafName.String, now,
+            )
 
 			if err != nil {
 				fmt.Printf("❌ Failed to create Melhaf order item: %v\n", err)
