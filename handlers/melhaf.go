@@ -780,21 +780,327 @@ func GetMelhafVideos(c *gin.Context) {
 		}
 		colorRows.Close()
 
+		// Get like count
+		var likeCount int
+		database.Database.QueryRow(
+			"SELECT COUNT(*) FROM melhaf_video_likes WHERE video_id = $1",
+			id,
+		).Scan(&likeCount)
+
+		// Get reaction counts
+		reactionCounts := make(map[string]int)
+		reactionRows, _ := database.Database.Query(
+			"SELECT reaction, COUNT(*) FROM melhaf_video_reactions WHERE video_id = $1 GROUP BY reaction",
+			id,
+		)
+		defer reactionRows.Close()
+		for reactionRows.Next() {
+			var reaction string
+			var count int
+			if err := reactionRows.Scan(&reaction, &count); err == nil {
+				reactionCounts[reaction] = count
+			}
+		}
+
+		// Get user's interactions if authenticated
+		var userLiked bool
+		var userReactions []string
+		userIDStr, exists := c.Get("user_id")
+		if exists {
+			userID, _ := uuid.Parse(userIDStr.(string))
+			database.Database.QueryRow(
+				"SELECT EXISTS(SELECT 1 FROM melhaf_video_likes WHERE video_id = $1 AND user_id = $2)",
+				id, userID,
+			).Scan(&userLiked)
+
+			userReactionRows, _ := database.Database.Query(
+				"SELECT reaction FROM melhaf_video_reactions WHERE video_id = $1 AND user_id = $2",
+				id, userID,
+			)
+			defer userReactionRows.Close()
+			for userReactionRows.Next() {
+				var reaction string
+				if err := userReactionRows.Scan(&reaction); err == nil {
+					userReactions = append(userReactions, reaction)
+				}
+			}
+		}
+
 		videos = append(videos, map[string]interface{}{
-			"id":             id.String(),
-			"collection_id":  collectionID.String(),
+			"id":              id.String(),
+			"collection_id":   collectionID.String(),
 			"collection_name": collectionName,
-			"title":          title,
-			"description":    description.String,
-			"video_url":      videoURL,
-			"thumbnail_url": thumbnailURL.String,
-			"duration":      duration.Int32,
-			"colors":         colors,
-			"created_at":     createdAt,
+			"title":           title,
+			"description":     description.String,
+			"video_url":       videoURL,
+			"thumbnail_url":   thumbnailURL.String,
+			"duration":        duration.Int32,
+			"colors":          colors,
+			"created_at":      createdAt,
+			"like_count":      likeCount,
+			"user_liked":      userLiked,
+			"reaction_counts": reactionCounts,
+			"user_reactions":  userReactions,
 		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": videos})
+}
+
+// ==================== VIDEO LIKES & REACTIONS ====================
+
+// LikeMelhafVideo handles POST /api/v1/melhaf/videos/:id/like
+func LikeMelhafVideo(c *gin.Context) {
+	userIDStr, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		return
+	}
+
+	userID, err := uuid.Parse(userIDStr.(string))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	videoIDStr := c.Param("id")
+	videoID, err := uuid.Parse(videoIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid video ID"})
+		return
+	}
+
+	// Check if like already exists
+	var existingLikeID uuid.UUID
+	err = database.Database.QueryRow(
+		"SELECT id FROM melhaf_video_likes WHERE video_id = $1 AND user_id = $2",
+		videoID, userID,
+	).Scan(&existingLikeID)
+
+	if err == nil {
+		// Unlike: delete the like
+		_, err = database.Database.Exec(
+			"DELETE FROM melhaf_video_likes WHERE id = $1",
+			existingLikeID,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unlike video"})
+			return
+		}
+
+		// Get updated like count
+		var likeCount int
+		database.Database.QueryRow(
+			"SELECT COUNT(*) FROM melhaf_video_likes WHERE video_id = $1",
+			videoID,
+		).Scan(&likeCount)
+
+		c.JSON(http.StatusOK, gin.H{
+			"success":   true,
+			"liked":    false,
+			"like_count": likeCount,
+		})
+		return
+	}
+
+	// Like: create new like
+	likeID := uuid.New()
+	_, err = database.Database.Exec(
+		"INSERT INTO melhaf_video_likes (id, video_id, user_id, created_at) VALUES ($1, $2, $3, now())",
+		likeID, videoID, userID,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to like video"})
+		return
+	}
+
+	// Get updated like count
+	var likeCount int
+	database.Database.QueryRow(
+		"SELECT COUNT(*) FROM melhaf_video_likes WHERE video_id = $1",
+		videoID,
+	).Scan(&likeCount)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":    true,
+		"liked":      true,
+		"like_count": likeCount,
+	})
+}
+
+// ReactToMelhafVideo handles POST /api/v1/melhaf/videos/:id/react
+func ReactToMelhafVideo(c *gin.Context) {
+	userIDStr, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication required"})
+		return
+	}
+
+	userID, err := uuid.Parse(userIDStr.(string))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	videoIDStr := c.Param("id")
+	videoID, err := uuid.Parse(videoIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid video ID"})
+		return
+	}
+
+	var req struct {
+		Reaction string `json:"reaction" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Reaction emoji required"})
+		return
+	}
+
+	// Validate reaction is a single emoji (basic check)
+	if len([]rune(req.Reaction)) > 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid reaction format"})
+		return
+	}
+
+	// Check if reaction already exists
+	var existingReactionID uuid.UUID
+	err = database.Database.QueryRow(
+		"SELECT id FROM melhaf_video_reactions WHERE video_id = $1 AND user_id = $2 AND reaction = $3",
+		videoID, userID, req.Reaction,
+	).Scan(&existingReactionID)
+
+	if err == nil {
+		// Remove reaction: delete it
+		_, err = database.Database.Exec(
+			"DELETE FROM melhaf_video_reactions WHERE id = $1",
+			existingReactionID,
+		)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to remove reaction"})
+			return
+		}
+
+		// Get updated reaction counts
+		reactionCounts := make(map[string]int)
+		rows, _ := database.Database.Query(
+			"SELECT reaction, COUNT(*) FROM melhaf_video_reactions WHERE video_id = $1 GROUP BY reaction",
+			videoID,
+		)
+		defer rows.Close()
+		for rows.Next() {
+			var reaction string
+			var count int
+			if err := rows.Scan(&reaction, &count); err == nil {
+				reactionCounts[reaction] = count
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"success":         true,
+			"reacted":        false,
+			"reaction":       req.Reaction,
+			"reaction_counts": reactionCounts,
+		})
+		return
+	}
+
+	// Add reaction: create new reaction
+	reactionID := uuid.New()
+	_, err = database.Database.Exec(
+		"INSERT INTO melhaf_video_reactions (id, video_id, user_id, reaction, created_at) VALUES ($1, $2, $3, $4, now())",
+		reactionID, videoID, userID, req.Reaction,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add reaction"})
+		return
+	}
+
+	// Get updated reaction counts
+	reactionCounts := make(map[string]int)
+	rows, _ := database.Database.Query(
+		"SELECT reaction, COUNT(*) FROM melhaf_video_reactions WHERE video_id = $1 GROUP BY reaction",
+		videoID,
+	)
+	defer rows.Close()
+	for rows.Next() {
+		var reaction string
+		var count int
+		if err := rows.Scan(&reaction, &count); err == nil {
+			reactionCounts[reaction] = count
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":         true,
+		"reacted":         true,
+		"reaction":        req.Reaction,
+		"reaction_counts": reactionCounts,
+	})
+}
+
+// GetVideoInteractions handles GET /api/v1/melhaf/videos/:id/interactions
+func GetVideoInteractions(c *gin.Context) {
+	videoIDStr := c.Param("id")
+	videoID, err := uuid.Parse(videoIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid video ID"})
+		return
+	}
+
+	// Get like count
+	var likeCount int
+	database.Database.QueryRow(
+		"SELECT COUNT(*) FROM melhaf_video_likes WHERE video_id = $1",
+		videoID,
+	).Scan(&likeCount)
+
+	// Get reaction counts
+	reactionCounts := make(map[string]int)
+	rows, _ := database.Database.Query(
+		"SELECT reaction, COUNT(*) FROM melhaf_video_reactions WHERE video_id = $1 GROUP BY reaction",
+		videoID,
+	)
+	defer rows.Close()
+	for rows.Next() {
+		var reaction string
+		var count int
+		if err := rows.Scan(&reaction, &count); err == nil {
+			reactionCounts[reaction] = count
+		}
+	}
+
+	// Get user's interactions if authenticated
+	var userLiked bool
+	var userReactions []string
+	userIDStr, exists := c.Get("user_id")
+	if exists {
+		userID, _ := uuid.Parse(userIDStr.(string))
+		database.Database.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM melhaf_video_likes WHERE video_id = $1 AND user_id = $2)",
+			videoID, userID,
+		).Scan(&userLiked)
+
+		reactionRows, _ := database.Database.Query(
+			"SELECT reaction FROM melhaf_video_reactions WHERE video_id = $1 AND user_id = $2",
+			videoID, userID,
+		)
+		defer reactionRows.Close()
+		for reactionRows.Next() {
+			var reaction string
+			if err := reactionRows.Scan(&reaction); err == nil {
+				userReactions = append(userReactions, reaction)
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":         true,
+		"like_count":      likeCount,
+		"user_liked":      userLiked,
+		"reaction_counts": reactionCounts,
+		"user_reactions":  userReactions,
+	})
 }
 
 // GetMelhafColorDetails handles GET /api/v1/melhaf/colors/:id

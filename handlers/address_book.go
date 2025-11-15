@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -14,9 +15,16 @@ import (
 
 // GetAddressBook gets all addresses for a user
 func GetAddressBook(c *gin.Context) {
-	userID, exists := c.Get("user_id")
+	userIDStr, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
+		return
+	}
+
+	// Parse userID string to UUID
+	userID, err := uuid.Parse(userIDStr.(string))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID format"})
 		return
 	}
 
@@ -69,16 +77,23 @@ func GetAddressBook(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"addresses": addresses})
 }
 
-// CreateAddress creates a new address
+// CreateAddress creates a new address (simplified: only city and quartier required)
 func CreateAddress(c *gin.Context) {
-	userID, exists := c.Get("user_id")
+	userIDStr, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
 		return
 	}
 
+	// Parse userID string to UUID
+	userID, err := uuid.Parse(userIDStr.(string))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID format"})
+		return
+	}
+
 	var req struct {
-		Label     string   `json:"label" binding:"required"`
+		Label     *string  `json:"label,omitempty"`
 		City      string   `json:"city" binding:"required"`
 		Quartier  string   `json:"quartier" binding:"required"`
 		Street    *string  `json:"street,omitempty"`
@@ -87,7 +102,6 @@ func CreateAddress(c *gin.Context) {
 		Apartment *string  `json:"apartment,omitempty"`
 		Latitude  *float64 `json:"latitude,omitempty"`
 		Longitude *float64 `json:"longitude,omitempty"`
-		IsDefault bool     `json:"is_default"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -95,13 +109,34 @@ func CreateAddress(c *gin.Context) {
 		return
 	}
 
+	// Check if this is the first address for this user
+	var existingAddressCount int
+	countQuery := `SELECT COUNT(*) FROM address_book WHERE user_id = $1 AND is_active = true`
+	err = DB.QueryRow(countQuery, userID).Scan(&existingAddressCount)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check existing addresses"})
+		return
+	}
+
+	// First address is automatically set as default
+	isDefault := existingAddressCount == 0
+
 	// If this is set as default, unset other defaults
-	if req.IsDefault {
+	if isDefault {
 		_, err := DB.Exec("UPDATE address_book SET is_default = false WHERE user_id = $1", userID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update existing defaults"})
 			return
 		}
+	}
+
+	// Auto-generate label if not provided
+	label := ""
+	if req.Label != nil && *req.Label != "" {
+		label = *req.Label
+	} else {
+		// Generate label: "Address 1", "Address 2", etc.
+		label = fmt.Sprintf("Address %d", existingAddressCount+1)
 	}
 
 	addressID := uuid.New()
@@ -111,10 +146,10 @@ func CreateAddress(c *gin.Context) {
 	          floor, apartment, latitude, longitude, is_default, is_active, created_at, updated_at)
 	          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
 	
-	_, err := DB.Exec(query,
-		addressID, userID, req.Label, req.City, req.Quartier,
+	_, err = DB.Exec(query,
+		addressID, userID, label, req.City, req.Quartier,
 		req.Street, req.Building, req.Floor, req.Apartment,
-		req.Latitude, req.Longitude, req.IsDefault, true, now, now,
+		req.Latitude, req.Longitude, isDefault, true, now, now,
 	)
 	
 	if err != nil {
@@ -125,14 +160,22 @@ func CreateAddress(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Address created successfully",
 		"address_id": addressID,
+		"is_default": isDefault,
 	})
 }
 
 // UpdateAddress updates an existing address
 func UpdateAddress(c *gin.Context) {
-	userID, exists := c.Get("user_id")
+	userIDStr, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
+		return
+	}
+
+	// Parse userID string to UUID
+	userID, err := uuid.Parse(userIDStr.(string))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID format"})
 		return
 	}
 
@@ -143,7 +186,6 @@ func UpdateAddress(c *gin.Context) {
 	}
 
 	var req struct {
-		Label     *string  `json:"label,omitempty"`
 		City      *string  `json:"city,omitempty"`
 		Quartier  *string  `json:"quartier,omitempty"`
 		Street    *string  `json:"street,omitempty"`
@@ -152,33 +194,17 @@ func UpdateAddress(c *gin.Context) {
 		Apartment *string  `json:"apartment,omitempty"`
 		Latitude  *float64 `json:"latitude,omitempty"`
 		Longitude *float64 `json:"longitude,omitempty"`
-		IsDefault *bool    `json:"is_default,omitempty"`
 	}
 
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err = c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
-	}
-
-	// If this is set as default, unset other defaults
-	if req.IsDefault != nil && *req.IsDefault {
-		_, err := DB.Exec("UPDATE address_book SET is_default = false WHERE user_id = $1 AND id != $2", userID, addressID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update existing defaults"})
-			return
-		}
 	}
 
 	// Build dynamic update query
 	query := "UPDATE address_book SET "
 	args := []interface{}{}
 	argIndex := 1
-
-	if req.Label != nil {
-		query += "label = $" + strconv.Itoa(argIndex) + ", "
-		args = append(args, *req.Label)
-		argIndex++
-	}
 
 	if req.City != nil {
 		query += "city = $" + strconv.Itoa(argIndex) + ", "
@@ -228,12 +254,6 @@ func UpdateAddress(c *gin.Context) {
 		argIndex++
 	}
 
-	if req.IsDefault != nil {
-		query += "is_default = $" + strconv.Itoa(argIndex) + ", "
-		args = append(args, *req.IsDefault)
-		argIndex++
-	}
-
 	if len(args) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No fields to update"})
 		return
@@ -243,7 +263,7 @@ func UpdateAddress(c *gin.Context) {
 	query += "updated_at = $" + strconv.Itoa(argIndex) + " WHERE id = $" + strconv.Itoa(argIndex+1) + " AND user_id = $" + strconv.Itoa(argIndex+2)
 	args = append(args, time.Now(), addressID, userID)
 
-	_, err := DB.Exec(query, args...)
+	_, err = DB.Exec(query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update address"})
 		return
@@ -254,9 +274,16 @@ func UpdateAddress(c *gin.Context) {
 
 // DeleteAddress soft deletes an address
 func DeleteAddress(c *gin.Context) {
-	userID, exists := c.Get("user_id")
+	userIDStr, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
+		return
+	}
+
+	// Parse userID string to UUID
+	userID, err := uuid.Parse(userIDStr.(string))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID format"})
 		return
 	}
 
@@ -266,7 +293,7 @@ func DeleteAddress(c *gin.Context) {
 		return
 	}
 
-	_, err := DB.Exec("UPDATE address_book SET is_active = false, updated_at = $1 WHERE id = $2 AND user_id = $3", time.Now(), addressID, userID)
+	_, err = DB.Exec("UPDATE address_book SET is_active = false, updated_at = $1 WHERE id = $2 AND user_id = $3", time.Now(), addressID, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete address"})
 		return

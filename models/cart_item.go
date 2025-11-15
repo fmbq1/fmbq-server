@@ -7,11 +7,14 @@ import (
 )
 
 type CartItem struct {
-	ID        uuid.UUID `json:"id" db:"id"`
-	CartID    uuid.UUID `json:"cart_id" db:"cart_id"`
-	SKUID     uuid.UUID `json:"sku_id" db:"sku_id"`
-	Quantity  int       `json:"quantity" db:"quantity"`
-	AddedAt   time.Time `json:"added_at" db:"added_at"`
+	ID             uuid.UUID `json:"id" db:"id"`
+	CartID         uuid.UUID `json:"cart_id" db:"cart_id"`
+	SKUID          uuid.UUID `json:"sku_id" db:"sku_id"`
+	Quantity       int       `json:"quantity" db:"quantity"`
+	AddedAt        time.Time `json:"added_at" db:"added_at"`
+	ProductName    string    `json:"product_name" db:"product_name"`
+	ProductImageURL string   `json:"product_image_url" db:"product_image_url"`
+	ProductPrice   float64   `json:"product_price" db:"product_price"`
 }
 
 func (CartItem) TableName() string {
@@ -25,6 +28,9 @@ func (CartItem) CreateTableSQL() string {
 		cart_id UUID REFERENCES carts(id) ON DELETE CASCADE,
 		sku_id UUID REFERENCES skus(id),
 		quantity INT NOT NULL DEFAULT 1,
-		added_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+		added_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+		product_name TEXT,
+		product_image_url TEXT,
+		product_price DECIMAL(10, 2) DEFAULT 0
 	);`
 }

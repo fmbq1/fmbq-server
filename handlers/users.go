@@ -8,6 +8,7 @@ import (
 	"fmbq-server/models"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 func GetUserProfile(c *gin.Context) {
@@ -68,9 +69,16 @@ func GetUserProfile(c *gin.Context) {
 }
 
 func UpdateUserProfile(c *gin.Context) {
-	userID, exists := c.Get("user_id")
+	userIDStr, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
+		return
+	}
+
+	// Parse userID string to UUID
+	userID, err := uuid.Parse(userIDStr.(string))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID format"})
 		return
 	}
 
@@ -80,7 +88,7 @@ func UpdateUserProfile(c *gin.Context) {
 		Metadata string  `json:"metadata,omitempty"`
 	}
 
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err = c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -114,16 +122,45 @@ func UpdateUserProfile(c *gin.Context) {
 	}
 
 	// Remove trailing comma and add WHERE clause
-	query = query[:len(query)-2] + " WHERE id = $" + strconv.Itoa(argIndex)
+	query = query[:len(query)-2] + ", updated_at = now() WHERE id = $" + strconv.Itoa(argIndex)
 	args = append(args, userID)
 
-	_, err := DB.Exec(query, args...)
+	_, err = DB.Exec(query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user profile"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Profile updated successfully"})
+	// Return updated user data
+	var updatedUser models.User
+	fetchQuery := `SELECT id, email, phone, full_name, role, is_active, created_at, metadata 
+	               FROM users WHERE id = $1`
+	err = DB.QueryRow(fetchQuery, userID).Scan(
+		&updatedUser.ID, &updatedUser.Email, &updatedUser.Phone, &updatedUser.FullName,
+		&updatedUser.Role, &updatedUser.IsActive, &updatedUser.CreatedAt, &updatedUser.Metadata,
+	)
+	if err != nil {
+		// Still return success even if fetch fails
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Profile updated successfully",
+			"user": gin.H{
+				"id":        userID,
+				"full_name": req.FullName,
+				"email":     req.Email,
+			},
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Profile updated successfully",
+		"user": gin.H{
+			"id":        updatedUser.ID,
+			"full_name": updatedUser.FullName,
+			"email":     updatedUser.Email,
+			"phone":     updatedUser.Phone,
+		},
+	})
 }
 
 // func GetUserOrders(c *gin.Context) {

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"fmbq-server/database"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -95,15 +97,34 @@ func LoginUser(c *gin.Context) {
 		return
 	}
 
-	// Generate JWT token (15 days expiration)
-	phoneStr := ""
-	if user.Phone != nil {
-		phoneStr = *user.Phone
-	}
-	token, err := generateJWTToken(user.ID.String(), phoneStr)
+	// Generate permanent UUID-based token
+	permanentToken := uuid.New().String()
+	
+	fmt.Printf("🔑 Generated token for user %s: %s (length: %d)\n", user.ID.String(), permanentToken, len(permanentToken))
+	
+	// Store token in database
+	tokenID := uuid.New()
+	insertTokenQuery := `INSERT INTO user_tokens (id, user_id, token, created_at, last_used, revoked)
+	                     VALUES ($1, $2, $3, $4, $5, $6)`
+	result, err := database.Database.Exec(insertTokenQuery,
+		tokenID, user.ID, permanentToken, time.Now(), time.Now(), false)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		fmt.Printf("❌ Failed to insert token: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create token"})
 		return
+	}
+	
+	rowsAffected, _ := result.RowsAffected()
+	fmt.Printf("✅ Token inserted successfully. Rows affected: %d\n", rowsAffected)
+	
+	// Verify token was inserted
+	var verifyToken string
+	verifyQuery := `SELECT token FROM user_tokens WHERE token = $1 AND revoked = false`
+	err = database.Database.QueryRow(verifyQuery, permanentToken).Scan(&verifyToken)
+	if err != nil {
+		fmt.Printf("⚠️ WARNING: Token verification failed after insert: %v\n", err)
+	} else {
+		fmt.Printf("✅ Token verified in database: %s\n", verifyToken[:20] + "...")
 	}
 
 	// Return user data and token
@@ -124,7 +145,7 @@ func LoginUser(c *gin.Context) {
 			"is_active":  user.IsActive,
 			"created_at": user.CreatedAt,
 		},
-		"token": token,
+		"token": permanentToken,
 		"message": "Login successful",
 	})
 }
@@ -193,10 +214,17 @@ func RegisterUser(c *gin.Context) {
 		return
 	}
 
-	// Generate JWT token
-	token, err := generateJWTToken(userID, req.Phone)
+	// Generate permanent UUID-based token
+	permanentToken := uuid.New().String()
+	
+	// Store token in database
+	tokenID := uuid.New()
+	insertTokenQuery := `INSERT INTO user_tokens (id, user_id, token, created_at, last_used, revoked)
+	                     VALUES ($1, $2, $3, $4, $5, $6)`
+	_, err = database.Database.Exec(insertTokenQuery,
+		tokenID, userID, permanentToken, time.Now(), time.Now(), false)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create token"})
 		return
 	}
 
@@ -209,7 +237,7 @@ func RegisterUser(c *gin.Context) {
 			"is_active":  true,
 			"created_at": time.Now(),
 		},
-		"token": token,
+		"token": permanentToken,
 		"message": "Registration successful",
 	})
 }
@@ -260,12 +288,36 @@ func VerifyToken(c *gin.Context) {
 	c.Next()
 }
 
-// Logout user (client-side token removal)
+// Logout user - revoke token in database
 func LogoutUser(c *gin.Context) {
+	// Get token from Authorization header
+	authHeader := c.GetHeader("Authorization")
+	if authHeader == "" || len(authHeader) < 7 || authHeader[:7] != "Bearer " {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
+		return
+	}
+
+	tokenString := authHeader[7:] // Remove "Bearer " prefix
+
+	// Revoke token in database
+	revokeQuery := `UPDATE user_tokens SET revoked = true WHERE token = $1 AND revoked = false`
+	result, err := database.Database.Exec(revokeQuery, tokenString)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to revoke token"})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// Token might already be revoked or doesn't exist, but still return success
+		c.JSON(http.StatusOK, gin.H{"message": "Logout successful"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "Logout successful"})
 }
 
-// ValidateToken validates a JWT token
+// ValidateToken validates a permanent token from database
 func ValidateToken(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" {
@@ -279,24 +331,38 @@ func ValidateToken(c *gin.Context) {
 		return
 	}
 
-	claims := &Claims{}
-	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-		return []byte("your-secret-key"), nil // TODO: Move to environment variable
-	})
-
-	if err != nil || !token.Valid {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+	// Validate token from database
+	var userID uuid.UUID
+	var phone sql.NullString
+	
+	query := `SELECT ut.user_id, u.phone 
+	          FROM user_tokens ut
+	          JOIN users u ON ut.user_id = u.id
+	          WHERE ut.token = $1 AND ut.revoked = false AND u.is_active = true`
+	
+	err := database.Database.QueryRow(query, tokenString).Scan(&userID, &phone)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or revoked token"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		}
 		return
+	}
+
+	phoneValue := ""
+	if phone.Valid {
+		phoneValue = phone.String
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"valid": true,
-		"user_id": claims.UserID,
-		"phone": claims.Phone,
+		"user_id": userID.String(),
+		"phone": phoneValue,
 	})
 }
 
-// AuthMiddleware validates JWT tokens
+// AuthMiddleware validates permanent tokens from database
 func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		fmt.Printf("AuthMiddleware called for: %s %s\n", c.Request.Method, c.Request.URL.Path)
@@ -319,34 +385,208 @@ func AuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		fmt.Printf("Token string: %s\n", tokenString)
+		// Trim any whitespace from token
+		tokenString = strings.TrimSpace(tokenString)
+		
+		fmt.Printf("Token string: %s (length: %d)\n", tokenString, len(tokenString))
 
-		claims := &Claims{}
-		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-			return []byte("your-secret-key"), nil // TODO: Move to environment variable
-		})
+		// Validate token format (should be UUID format, 36 chars)
+		if len(tokenString) == 0 {
+			fmt.Println("Empty token string")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token is required"})
+			c.Abort()
+			return
+		}
 
+		// Validate token from database
+		var userID uuid.UUID
+		var phone sql.NullString
+		var fullName sql.NullString
+		
+		query := `SELECT ut.user_id, u.phone, u.full_name 
+		          FROM user_tokens ut
+		          JOIN users u ON ut.user_id = u.id
+		          WHERE ut.token = $1 AND ut.revoked = false AND u.is_active = true`
+		
+		err := database.Database.QueryRow(query, tokenString).Scan(&userID, &phone, &fullName)
 		if err != nil {
-			fmt.Printf("JWT parse error: %v\n", err)
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			if err == sql.ErrNoRows {
+				tokenPreview := tokenString
+				if len(tokenString) > 20 {
+					tokenPreview = tokenString[:20] + "..."
+				}
+				fmt.Printf("❌ Token not found in database. Token preview: %s (length: %d)\n", tokenPreview, len(tokenString))
+				
+				// Debug: Check if token exists at all (without joins)
+				var tokenExists bool
+				existsQuery := `SELECT EXISTS(SELECT 1 FROM user_tokens WHERE token = $1)`
+				existsErr := database.Database.QueryRow(existsQuery, tokenString).Scan(&tokenExists)
+				if existsErr == nil && tokenExists {
+					fmt.Printf("⚠️ Token exists in user_tokens table but query failed\n")
+					// Check if token is revoked
+					var revoked bool
+					checkRevokedQuery := `SELECT revoked FROM user_tokens WHERE token = $1`
+					revokedErr := database.Database.QueryRow(checkRevokedQuery, tokenString).Scan(&revoked)
+					if revokedErr == nil {
+						if revoked {
+							fmt.Printf("⚠️ Token exists but is revoked\n")
+							c.JSON(http.StatusUnauthorized, gin.H{
+								"error": "Token has been revoked. Please log in again.",
+							})
+						} else {
+							// Token exists and not revoked, check user status
+							var userActive bool
+							userQuery := `SELECT u.is_active FROM user_tokens ut JOIN users u ON ut.user_id = u.id WHERE ut.token = $1`
+							userErr := database.Database.QueryRow(userQuery, tokenString).Scan(&userActive)
+							if userErr == nil && !userActive {
+								fmt.Printf("⚠️ Token exists but user is inactive\n")
+								c.JSON(http.StatusUnauthorized, gin.H{
+									"error": "Account is inactive. Please contact support.",
+								})
+							} else {
+								fmt.Printf("⚠️ Token exists but query join failed: %v\n", userErr)
+								c.JSON(http.StatusUnauthorized, gin.H{
+									"error": "Invalid token. Please log in again.",
+								})
+							}
+						}
+					} else {
+						fmt.Printf("⚠️ Could not check revocation status: %v\n", revokedErr)
+						c.JSON(http.StatusUnauthorized, gin.H{
+							"error": "Invalid token. Please log in again.",
+						})
+					}
+				} else {
+					// Token doesn't exist at all
+					fmt.Printf("⚠️ Token does not exist in database at all\n")
+					// Check if it might be a JWT token (old system) - JWTs are typically > 100 chars
+					if len(tokenString) > 100 {
+						c.JSON(http.StatusUnauthorized, gin.H{
+							"error": "Invalid token. Please log out and log in again to refresh your session.",
+						})
+					} else {
+						c.JSON(http.StatusUnauthorized, gin.H{
+							"error": "Invalid token. Please log in again.",
+						})
+					}
+				}
+			} else {
+				fmt.Printf("❌ Database error during token validation: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+			}
 			c.Abort()
 			return
 		}
 
-		if !token.Valid {
-			fmt.Println("Token is not valid")
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
-			c.Abort()
-			return
+		// Update last_used timestamp
+		updateQuery := `UPDATE user_tokens SET last_used = $1 WHERE token = $2`
+		database.Database.Exec(updateQuery, time.Now(), tokenString)
+
+		phoneValue := ""
+		if phone.Valid {
+			phoneValue = phone.String
 		}
 
-		fmt.Printf("Token valid, user ID: %s, phone: %s\n", claims.UserID, claims.Phone)
+		fmt.Printf("Token valid, user ID: %s, phone: %s\n", userID.String(), phoneValue)
 
 		// Set user info in context for use in protected routes
-		c.Set("user_id", claims.UserID)
-		c.Set("user_phone", claims.Phone)
+		c.Set("user_id", userID.String())
+		c.Set("user_phone", phoneValue)
 		c.Next()
 	}
+}
+
+// ChangePassword changes user password and revokes all existing tokens
+func ChangePassword(c *gin.Context) {
+	userIDStr, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	userID, err := uuid.Parse(userIDStr.(string))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
+		return
+	}
+
+	var req struct {
+		CurrentPassword string `json:"current_password" binding:"required"`
+		NewPassword     string `json:"new_password" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	// Validate new password
+	if len(req.NewPassword) < 6 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "New password must be at least 6 characters"})
+		return
+	}
+
+	// Get current password hash
+	var currentPasswordHash string
+	query := `SELECT password_hash FROM users WHERE id = $1`
+	err = database.Database.QueryRow(query, userID).Scan(&currentPasswordHash)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		}
+		return
+	}
+
+	// Verify current password
+	err = bcrypt.CompareHashAndPassword([]byte(currentPasswordHash), []byte(req.CurrentPassword))
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Current password is incorrect"})
+		return
+	}
+
+	// Hash new password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+		return
+	}
+
+	// Update password and revoke all tokens in a transaction
+	tx, err := database.Database.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
+		return
+	}
+	defer tx.Rollback()
+
+	// Update password
+	updateQuery := `UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`
+	_, err = tx.Exec(updateQuery, string(hashedPassword), userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update password"})
+		return
+	}
+
+	// Revoke all user tokens
+	revokeQuery := `UPDATE user_tokens SET revoked = true WHERE user_id = $1 AND revoked = false`
+	_, err = tx.Exec(revokeQuery, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to revoke tokens"})
+		return
+	}
+
+	// Commit transaction
+	err = tx.Commit()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Password changed successfully. Please log in again.",
+	})
 }
 
 // SendOTP placeholder function

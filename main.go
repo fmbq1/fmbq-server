@@ -208,6 +208,7 @@ func main() {
 			auth.POST("/register", handlers.RegisterUser)
 			auth.POST("/logout", handlers.LogoutUser)
 			auth.GET("/validate", handlers.ValidateToken)
+			auth.PUT("/change-password", handlers.AuthMiddleware(), handlers.ChangePassword)
 			auth.PUT("/update-push-token", handlers.AuthMiddleware(), handlers.UpdatePushToken)
 		}
 
@@ -401,6 +402,15 @@ func main() {
 		api.GET("/melhaf/videos", handlers.GetMelhafVideos)
 		api.GET("/melhaf/colors/:id", handlers.GetMelhafColorDetails)
 		
+		// Authenticated Melhaf video interactions
+		melhaf := api.Group("/melhaf/videos")
+		melhaf.Use(handlers.AuthMiddleware())
+		{
+			melhaf.POST("/:id/like", handlers.LikeMelhafVideo)
+			melhaf.POST("/:id/react", handlers.ReactToMelhafVideo)
+			melhaf.GET("/:id/interactions", handlers.GetVideoInteractions)
+		}
+		
 		// Public Maison Adrar routes
 		api.GET("/maison-adrar/feed", handlers.GetMaisonAdrarFeed)
 		api.GET("/maison-adrar/banners", handlers.GetMaisonAdrarBanners)
@@ -510,6 +520,27 @@ func main() {
 			pos.POST("/orders", handlers.CreatePOSOrder)
 		}
 	}
+
+	// Start background task for processing scheduled notifications
+	go func() {
+		scheduler := services.NewNotificationScheduler()
+		ticker := time.NewTicker(5 * time.Minute) // Check every 5 minutes
+		defer ticker.Stop()
+		
+		log.Println("🔔 Background notification processor started")
+		
+		// Process immediately on startup
+		if err := scheduler.ProcessScheduledNotifications(); err != nil {
+			log.Printf("⚠️ Error processing scheduled notifications: %v", err)
+		}
+		
+		// Process periodically
+		for range ticker.C {
+			if err := scheduler.ProcessScheduledNotifications(); err != nil {
+				log.Printf("⚠️ Error processing scheduled notifications: %v", err)
+			}
+		}
+	}()
 
 	// Start server
 	log.Printf("Starting FMBQ Server on 0.0.0.0:%s", config.AppConfig.ServerPort)

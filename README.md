@@ -196,11 +196,11 @@ The server automatically creates all necessary tables on startup. The initializa
 go run main.go
 ```
 
-The server will run on `http://192.168.0.131:8080` by default.
+The server will run on `https://fmbq-server.onrender.com` by default.
 
 ### Health Check
 
-Visit `http://192.168.0.131:8080/health` to check if the server is running.
+Visit `https://fmbq-server.onrender.com/health` to check if the server is running.
 
 ## Production Deployment
 
@@ -223,5 +223,5 @@ Visit `http://192.168.0.131:8080/health` to check if the server is running.
 This project is licensed under the MIT License.
 "# fmbq-server"
 "# fmbq-server"
-"# fmbq-admn" 
-"# fmbq-admn" 
+"# fmbq-admn"
+"# fmbq-admn"

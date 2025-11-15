@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 
 	"fmbq-server/database"
 	"fmbq-server/models"
+	"fmbq-server/services"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -274,15 +276,53 @@ func AddToWishlist(c *gin.Context) {
 		return
 	}
 
+	// Fetch product metadata (name, image, price) for notifications
+	var productName, productImageURL sql.NullString
+	var productPrice sql.NullFloat64
+	
+	metadataQuery := `
+		SELECT 
+			pm.title,
+			COALESCE(
+				(SELECT pi.url FROM product_images pi 
+				 WHERE pi.product_model_id = pm.id 
+				 ORDER BY pi.position ASC LIMIT 1),
+				''
+			) as image_url,
+			COALESCE(
+				(SELECT p.sale_price FROM prices p 
+				 JOIN skus s ON p.sku_id = s.id 
+				 WHERE s.product_model_id = pm.id AND p.currency = 'MRO' 
+				 ORDER BY p.sale_price ASC LIMIT 1),
+				(SELECT p.list_price FROM prices p 
+				 JOIN skus s ON p.sku_id = s.id 
+				 WHERE s.product_model_id = pm.id AND p.currency = 'MRO' 
+				 ORDER BY p.list_price ASC LIMIT 1),
+				0
+			) as price
+		FROM product_models pm
+		WHERE pm.id = $1
+	`
+	err = database.Database.QueryRow(metadataQuery, request.ProductID).Scan(&productName, &productImageURL, &productPrice)
+	if err != nil {
+		// If metadata fetch fails, use defaults but continue
+		productName = sql.NullString{String: "Product", Valid: true}
+		productImageURL = sql.NullString{String: "", Valid: true}
+		productPrice = sql.NullFloat64{Float64: 0, Valid: true}
+	}
+
 	// Add to wishlist
 	wishlistID := uuid.New().String()
 	now := time.Now()
 
 	_, err = database.Database.Exec(
-		"INSERT INTO wishlist_items (id, user_id, product_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5)",
+		"INSERT INTO wishlist_items (id, user_id, product_id, product_name, product_image_url, product_price, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
 		wishlistID,
 		userID,
 		request.ProductID,
+		productName.String,
+		productImageURL.String,
+		productPrice.Float64,
 		now,
 		now,
 	)
@@ -290,6 +330,23 @@ func AddToWishlist(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add to wishlist"})
 		return
 	}
+
+	// Schedule wishlist reminder notifications
+	go func() {
+		scheduler := services.NewNotificationScheduler()
+		productUUID, err := uuid.Parse(request.ProductID)
+		if err == nil {
+			if err := scheduler.ScheduleWishlistReminders(
+				uuid.MustParse(userID),
+				productUUID,
+				productName.String,
+				productImageURL.String,
+				productPrice.Float64,
+			); err != nil {
+				fmt.Printf("⚠️ Failed to schedule wishlist reminders: %v\n", err)
+			}
+		}
+	}()
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "Product added to wishlist",
@@ -310,6 +367,15 @@ func RemoveFromWishlist(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Product ID is required"})
 		return
 	}
+
+	// Cancel wishlist reminder notifications before removing
+	go func() {
+		scheduler := services.NewNotificationScheduler()
+		productUUID, err := uuid.Parse(productID)
+		if err == nil {
+			scheduler.CancelWishlistReminders(uuid.MustParse(userID), productUUID)
+		}
+	}()
 
 	// Remove from wishlist
 	result, err := database.Database.Exec(

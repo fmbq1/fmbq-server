@@ -576,6 +576,21 @@ func CreateOrder(c *gin.Context) {
 	}
 	fmt.Printf("✅ Transaction committed successfully\n")
 
+	// Cancel cart reminder notifications since order was placed
+	go func() {
+		scheduler := services.NewNotificationScheduler()
+		userUUID, err := uuid.Parse(userID)
+		if err != nil {
+			fmt.Printf("⚠️ Failed to parse user ID for cart reminder cancellation: %v\n", err)
+			return
+		}
+		if err := scheduler.CancelCartReminders(userUUID); err != nil {
+			fmt.Printf("⚠️ Failed to cancel cart reminders: %v\n", err)
+		} else {
+			fmt.Printf("✅ Cancelled cart reminder notifications for user %s\n", userID)
+		}
+	}()
+
 	// Send push notification for order creation (async, non-blocking)
 	go func() {
 		fmt.Printf("🔔 Starting push notification process for order #%s\n", orderNumber)

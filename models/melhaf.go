@@ -192,3 +192,57 @@ func (MelhafInventory) CreateTableSQL() string {
 	);`
 }
 
+// MelhafVideoLike represents a user's like on a video
+type MelhafVideoLike struct {
+	ID        uuid.UUID `json:"id" db:"id"`
+	VideoID   uuid.UUID `json:"video_id" db:"video_id"`
+	UserID    uuid.UUID `json:"user_id" db:"user_id"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+func (MelhafVideoLike) TableName() string {
+	return "melhaf_video_likes"
+}
+
+func (MelhafVideoLike) CreateTableSQL() string {
+	return `
+	CREATE TABLE IF NOT EXISTS melhaf_video_likes (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		video_id UUID NOT NULL REFERENCES melhaf_videos(id) ON DELETE CASCADE,
+		user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+		UNIQUE(video_id, user_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_melhaf_video_likes_video_id ON melhaf_video_likes (video_id);
+	CREATE INDEX IF NOT EXISTS idx_melhaf_video_likes_user_id ON melhaf_video_likes (user_id);
+	`
+}
+
+// MelhafVideoReaction represents a user's reaction (emoji) on a video
+type MelhafVideoReaction struct {
+	ID        uuid.UUID `json:"id" db:"id"`
+	VideoID   uuid.UUID `json:"video_id" db:"video_id"`
+	UserID    uuid.UUID `json:"user_id" db:"user_id"`
+	Reaction  string    `json:"reaction" db:"reaction"` // Emoji like "❤️", "🔥", "👍", etc.
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+}
+
+func (MelhafVideoReaction) TableName() string {
+	return "melhaf_video_reactions"
+}
+
+func (MelhafVideoReaction) CreateTableSQL() string {
+	return `
+	CREATE TABLE IF NOT EXISTS melhaf_video_reactions (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		video_id UUID NOT NULL REFERENCES melhaf_videos(id) ON DELETE CASCADE,
+		user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		reaction TEXT NOT NULL,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+		UNIQUE(video_id, user_id, reaction)
+	);
+	CREATE INDEX IF NOT EXISTS idx_melhaf_video_reactions_video_id ON melhaf_video_reactions (video_id);
+	CREATE INDEX IF NOT EXISTS idx_melhaf_video_reactions_user_id ON melhaf_video_reactions (user_id);
+	`
+}
+

@@ -51,6 +51,7 @@ func (db *DB) InitializeTables() error {
 		models.Inventory{},
 		models.Price{},
 		models.User{},
+		models.UserToken{},
 		models.LoyaltyAccount{},
 		models.LoyaltyTransaction{},
 		models.Address{},
@@ -76,6 +77,8 @@ func (db *DB) InitializeTables() error {
 		models.MelhafColorImage{},
 		models.MelhafVideo{},
 		models.MelhafInventory{},
+		models.MelhafVideoLike{},
+		models.MelhafVideoReaction{},
 		// Maison Adrar models
 		models.MaisonAdrarCategory{},
 		models.MaisonAdrarCollection{},
@@ -85,6 +88,7 @@ func (db *DB) InitializeTables() error {
 		models.FeedBlock{},
 		models.FeedBlockItem{},
 		models.Campaign{},
+		models.ScheduledNotification{},
 	}
 
 	for _, model := range models {
@@ -351,6 +355,37 @@ func (db *DB) runMigrations() error {
 		`INSERT INTO users (id, phone, full_name, role, is_active, created_at, metadata) 
 		 VALUES (gen_random_uuid(), '+22212345678', 'Admin User', 'admin', true, now(), '{}')
 		 ON CONFLICT (phone) DO NOTHING;`,
+		
+		// Add product metadata columns to cart_items for notifications
+		`ALTER TABLE cart_items ADD COLUMN IF NOT EXISTS product_name TEXT;`,
+		`ALTER TABLE cart_items ADD COLUMN IF NOT EXISTS product_image_url TEXT;`,
+		`ALTER TABLE cart_items ADD COLUMN IF NOT EXISTS product_price DECIMAL(10, 2) DEFAULT 0;`,
+		
+		// Add product metadata columns to wishlist_items for notifications
+		`ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS product_name TEXT;`,
+		`ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS product_image_url TEXT;`,
+		`ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS product_price DECIMAL(10, 2) DEFAULT 0;`,
+		
+		// Create scheduled_notifications table
+		`CREATE TABLE IF NOT EXISTS scheduled_notifications (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			type VARCHAR(50) NOT NULL CHECK (type IN ('cart-reminder', 'wishlist-reminder')),
+			reminder_type VARCHAR(20) NOT NULL CHECK (reminder_type IN ('6h', '24h', '3d', 'weekly')),
+			product_id UUID,
+			product_name TEXT NOT NULL,
+			product_image_url TEXT NOT NULL,
+			product_price DECIMAL(10, 2) DEFAULT 0,
+			scheduled_for TIMESTAMP WITH TIME ZONE NOT NULL,
+			sent BOOLEAN DEFAULT FALSE,
+			cancelled BOOLEAN DEFAULT FALSE,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+			updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_scheduled_notifications_user_id ON scheduled_notifications(user_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_scheduled_notifications_scheduled_for ON scheduled_notifications(scheduled_for);`,
+		`CREATE INDEX IF NOT EXISTS idx_scheduled_notifications_sent ON scheduled_notifications(sent);`,
+		`CREATE INDEX IF NOT EXISTS idx_scheduled_notifications_cancelled ON scheduled_notifications(cancelled);`,
 	}
 
 	for i, migration := range migrations {
