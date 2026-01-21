@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"fmbq-server/database"
@@ -35,20 +36,91 @@ func RegisterProductView(c *gin.Context) {
 		return
 	}
 
-	// Get user ID from auth context (if authenticated)
+	// Get user ID from auth context or by validating token (if authenticated)
 	var userID uuid.NullUUID
+	var phoneNumber string
+	var anonymousSessionID string
+	
+	// Try to get from context first (if AuthMiddleware was used)
 	if userIDInterface, exists := c.Get("user_id"); exists {
 		if userIDStr, ok := userIDInterface.(string); ok {
 			if parsedUserID, err := uuid.Parse(userIDStr); err == nil {
 				userID = uuid.NullUUID{UUID: parsedUserID, Valid: true}
+				fmt.Printf("📊 Got user_id from context: %s\n", userID.UUID.String())
+			}
+		}
+		// Get phone number from user context if authenticated
+		if phoneInterface, exists := c.Get("phone"); exists {
+			if phoneStr, ok := phoneInterface.(string); ok {
+				phoneNumber = phoneStr
+			}
+		}
+		// Also try user_phone key
+		if phoneNumber == "" {
+			if phoneInterface, exists := c.Get("user_phone"); exists {
+				if phoneStr, ok := phoneInterface.(string); ok {
+					phoneNumber = phoneStr
+				}
+			}
+		}
+	}
+	
+	// If not in context, try to validate token from header (optional auth for this endpoint)
+	if !userID.Valid {
+		authHeader := c.GetHeader("Authorization")
+		if authHeader != "" && len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+			tokenString := strings.TrimSpace(authHeader[7:])
+			if tokenString != "" {
+				// Validate token from database
+				var fetchedUserID uuid.UUID
+				var fetchedPhone sql.NullString
+				query := `SELECT ut.user_id, u.phone 
+				          FROM user_tokens ut
+				          JOIN users u ON ut.user_id = u.id
+				          WHERE ut.token = $1 AND ut.revoked = false AND u.is_active = true`
+				err := database.Database.QueryRow(query, tokenString).Scan(&fetchedUserID, &fetchedPhone)
+				if err == nil {
+					userID = uuid.NullUUID{UUID: fetchedUserID, Valid: true}
+					if fetchedPhone.Valid {
+						phoneNumber = fetchedPhone.String
+					}
+					fmt.Printf("✅ Got user_id from token validation: %s\n", userID.UUID.String())
+				}
 			}
 		}
 	}
 
-	// Generate anonymous session ID if not authenticated
-	var anonymousSessionID string
+	// Get phone number and anonymous_session_id from request body if not authenticated
 	if !userID.Valid {
+		var requestBody struct {
+			PhoneNumber       string `json:"phone_number"`
+			AnonymousSessionID string `json:"anonymous_session_id"`
+		}
+		if err := c.ShouldBindJSON(&requestBody); err == nil {
+			phoneNumber = requestBody.PhoneNumber
+			if requestBody.AnonymousSessionID != "" {
+				anonymousSessionID = requestBody.AnonymousSessionID
+			}
+		}
+		// Also check query parameter as fallback
+		if phoneNumber == "" {
+			phoneNumber = c.Query("phone_number")
+		}
+		if anonymousSessionID == "" {
+			anonymousSessionID = c.Query("anonymous_session_id")
+		}
+	}
+
+	// IMPORTANT: If user is authenticated, DON'T use anonymous_session_id
+	// Only use anonymous_session_id for truly anonymous users
+	// This ensures views are properly associated with the user
+	if userID.Valid {
+		anonymousSessionID = "" // Clear it to avoid confusion
+		fmt.Printf("📊 Registering view for authenticated user: %s, Product: %s\n", userID.UUID.String(), productID.String())
+	} else if anonymousSessionID == "" {
+		// Only generate anonymous session ID if user is truly anonymous
 		anonymousSessionID = uuid.New().String()
+		fmt.Printf("📊 Registering view for anonymous user, Session: %s, Product: %s\n", anonymousSessionID[:20]+"...", productID.String())
 	}
 
 	// Get client info
@@ -79,6 +151,7 @@ func RegisterProductView(c *gin.Context) {
 	}
 
 	if duplicateExists {
+		fmt.Printf("ℹ️ Product view skipped (duplicate within 5 min) - Product: %s\n", productID.String())
 		c.JSON(http.StatusOK, gin.H{"message": "View already registered recently", "success": true})
 		return
 	}
@@ -86,13 +159,41 @@ func RegisterProductView(c *gin.Context) {
 	// Insert the view
 	viewID := uuid.New()
 	_, err = database.Database.Exec(`
-		INSERT INTO product_views (id, product_id, user_id, anonymous_session_id, view_timestamp, ip_address, user_agent)
-		VALUES ($1, $2, $3, $4, NOW(), $5, $6)
-	`, viewID, productID, userID, anonymousSessionID, ipAddress, userAgent)
+		INSERT INTO product_views (id, product_id, user_id, anonymous_session_id, phone_number, view_timestamp, ip_address, user_agent)
+		VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7)
+	`, viewID, productID, userID, anonymousSessionID, phoneNumber, ipAddress, userAgent)
 
 	if err != nil {
+		// Backwards-compatible fallback: if DB hasn't been migrated yet and phone_number column doesn't exist,
+		// retry insert without phone_number so view tracking never breaks UX.
+		if strings.Contains(err.Error(), `column "phone_number"`) {
+			fmt.Printf("⚠️ product_views.phone_number missing in DB, retrying insert without phone_number\n")
+			_, retryErr := database.Database.Exec(`
+				INSERT INTO product_views (id, product_id, user_id, anonymous_session_id, view_timestamp, ip_address, user_agent)
+				VALUES ($1, $2, $3, $4, NOW(), $5, $6)
+			`, viewID, productID, userID, anonymousSessionID, ipAddress, userAgent)
+			if retryErr == nil {
+				c.JSON(http.StatusOK, gin.H{"message": "View registered successfully", "success": true})
+				return
+			}
+			err = retryErr
+		}
+		fmt.Printf("❌ Error inserting product view: %v\n", err)
+		fmt.Printf("   Product ID: %s\n", productID.String())
+		fmt.Printf("   User ID: %v (Valid: %v)\n", userID, userID.Valid)
+		fmt.Printf("   Phone: %s\n", phoneNumber)
+		fmt.Printf("   Anonymous Session ID: %s\n", anonymousSessionID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register view"})
 		return
+	}
+
+	// Log successful view registration
+	if userID.Valid {
+		fmt.Printf("✅ Product view registered - Product: %s, User ID: %s\n", productID.String(), userID.UUID.String())
+	} else if anonymousSessionID != "" {
+		fmt.Printf("✅ Product view registered - Product: %s, Anonymous Session: %s\n", productID.String(), anonymousSessionID[:20]+"...")
+	} else {
+		fmt.Printf("✅ Product view registered - Product: %s, Phone: %s\n", productID.String(), phoneNumber)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "View registered successfully", "success": true})

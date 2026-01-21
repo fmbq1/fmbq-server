@@ -108,12 +108,23 @@ func GetAdminProducts(c *gin.Context) {
 
 		// Get colors and images for this product
 		var colors []gin.H
-		colorQuery := `SELECT id, color_name, color_code FROM product_colors WHERE product_model_id = $1 ORDER BY created_at`
+		colorQuery := `
+			SELECT pc.id, pc.color_name, pc.color_code,
+			       COALESCE(
+			         (SELECT array_agg(canonical_color_id::text) 
+			          FROM product_color_canonical_matches 
+			          WHERE product_color_id = pc.id), 
+			         ARRAY[]::text[]
+			       ) as canonical_color_ids
+			FROM product_colors pc 
+			WHERE pc.product_model_id = $1 
+			ORDER BY pc.created_at`
 		colorRows, err := DB.Query(colorQuery, id)
 		if err == nil {
 			for colorRows.Next() {
 				var colorID, colorName, colorCode string
-				if err := colorRows.Scan(&colorID, &colorName, &colorCode); err == nil {
+				var canonicalColorIDs []string
+				if err := colorRows.Scan(&colorID, &colorName, &colorCode, &canonicalColorIDs); err == nil {
 					// Get images for this color
 					var images []gin.H
 					imageQuery := `SELECT url, alt, position FROM product_images WHERE product_color_id = $1 ORDER BY position`
@@ -135,8 +146,9 @@ func GetAdminProducts(c *gin.Context) {
 
 					colors = append(colors, gin.H{
 						"id":    colorID,
-						"name":  colorName,
-						"code":  colorCode,
+				"name":               colorName,
+				"code":               colorCode,
+				"canonical_color_ids": canonicalColorIDs,
 						"images": images,
 					})
 				}
@@ -287,13 +299,24 @@ func GetAdminProduct(c *gin.Context) {
 
 	// Get colors with images
 	var colors []gin.H
-	colorQuery := `SELECT id, color_name, color_code FROM product_colors WHERE product_model_id = $1 ORDER BY created_at`
+	colorQuery := `
+		SELECT pc.id, pc.color_name, pc.color_code,
+		       COALESCE(
+		         (SELECT array_agg(canonical_color_id::text) 
+		          FROM product_color_canonical_matches 
+		          WHERE product_color_id = pc.id), 
+		         ARRAY[]::text[]
+		       ) as canonical_color_ids
+		FROM product_colors pc 
+		WHERE pc.product_model_id = $1 
+		ORDER BY pc.created_at`
 	rows, err = DB.Query(colorQuery, productID)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
-			var colorID, colorName, colorCode string
-			if err := rows.Scan(&colorID, &colorName, &colorCode); err == nil {
+		var colorID, colorName, colorCode string
+		var canonicalColorIDs []string
+		if err := rows.Scan(&colorID, &colorName, &colorCode, &canonicalColorIDs); err == nil {
 				// Get images for this color
 				var images []gin.H
 				imageQuery := `SELECT url, alt, position FROM product_images WHERE product_color_id = $1 ORDER BY position`
@@ -315,8 +338,9 @@ func GetAdminProduct(c *gin.Context) {
 
 				colors = append(colors, gin.H{
 					"id":    colorID,
-					"name":  colorName,
-					"code":  colorCode,
+					"name":               colorName,
+					"code":               colorCode,
+					"canonical_color_ids": canonicalColorIDs,
 					"images": images,
 				})
 			}
@@ -395,9 +419,10 @@ func CreateProduct(c *gin.Context) {
 		ShortDescription string   `json:"short_description"`
 		Categories       []string `json:"categories"`
 		Colors           []struct {
-			Name  string `json:"name" binding:"required"`
-			Code  string `json:"code"`
-			Images []struct {
+			Name              string   `json:"name" binding:"required"`
+			Code              string   `json:"code"`
+			CanonicalColorIDs []string `json:"canonical_color_ids"` // For matching with Melhafas
+			Images            []struct {
 				URL     string `json:"url" binding:"required"`
 				Alt     string `json:"alt"`
 				Position int    `json:"position"`
@@ -489,6 +514,25 @@ func CreateProduct(c *gin.Context) {
 
 		colorMap[color.Name] = colorID
 
+		// Assign canonical colors for matching (if provided)
+		if len(color.CanonicalColorIDs) > 0 {
+			for _, canonicalIDStr := range color.CanonicalColorIDs {
+				canonicalID, err := uuid.Parse(canonicalIDStr)
+				if err != nil {
+					fmt.Printf("Warning: Invalid canonical color ID %s: %v\n", canonicalIDStr, err)
+					continue
+				}
+				_, err = tx.Exec(`
+					INSERT INTO product_color_canonical_matches (id, product_color_id, canonical_color_id, created_at)
+					VALUES (gen_random_uuid(), $1, $2, now())
+					ON CONFLICT (product_color_id, canonical_color_id) DO NOTHING
+				`, colorID, canonicalID)
+				if err != nil {
+					fmt.Printf("Warning: Failed to assign canonical color %s to product color %s: %v\n", canonicalIDStr, color.Name, err)
+				}
+			}
+		}
+
 		// Create images for this color
 		for _, image := range color.Images {
 			imageID := uuid.New()
@@ -578,7 +622,14 @@ func CreateProduct(c *gin.Context) {
 // UpdateProduct updates an existing product
 func UpdateProduct(c *gin.Context) {
 	productID := c.Param("id")
-	
+
+	// Parse product UUID once for downstream logic (e.g., notifications)
+	productUUID, err := uuid.Parse(productID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid product ID"})
+		return
+	}
+
 	var req struct {
 		Title            string  `json:"title"`
 		Description      string  `json:"description"`
@@ -586,10 +637,11 @@ func UpdateProduct(c *gin.Context) {
 		IsActive         *bool   `json:"is_active,omitempty"`
 		Attributes       map[string]interface{} `json:"attributes"`
 		Colors           []struct {
-			ID    string `json:"id"`
-			Name  string `json:"name"`
-			Code  string `json:"code"`
-			Images []struct {
+			ID                string   `json:"id"`
+			Name              string   `json:"name"`
+			Code              string   `json:"code"`
+			CanonicalColorIDs []string `json:"canonical_color_ids"` // For matching with Melhafas
+			Images            []struct {
 				URL     string `json:"url"`
 				Alt     string `json:"alt"`
 				Position int    `json:"position"`
@@ -617,6 +669,14 @@ func UpdateProduct(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
+
+	// Get product model code for consistent SKU/EAN generation
+	var productCode string
+	if err := tx.QueryRow("SELECT model_code FROM product_models WHERE id = $1", productID).Scan(&productCode); err != nil {
+		fmt.Printf("Warning: failed to load product model_code for %s: %v\n", productID, err)
+		// Fallback to a generic prefix to avoid hard failures, but still log it
+		productCode = "PROD"
+	}
 
 	// Build dynamic update query for product_models
 	query := "UPDATE product_models SET "
@@ -694,17 +754,21 @@ func UpdateProduct(c *gin.Context) {
 		
 		for _, colorData := range req.Colors {
 			var colorID string
-			
+
 			// Check if color ID is valid UUID and exists
 			if colorData.ID != "" && len(colorData.ID) == 36 {
 				// Check if this color exists for this product
-				err = tx.QueryRow("SELECT id FROM product_colors WHERE id = $1 AND product_model_id = $2", 
-					colorData.ID, productID).Scan(&colorID)
-				
+				err = tx.QueryRow(
+					"SELECT id FROM product_colors WHERE id = $1 AND product_model_id = $2",
+					colorData.ID, productID,
+				).Scan(&colorID)
+
 				if err == nil {
 					// Color exists, update it
-					_, err = tx.Exec("UPDATE product_colors SET color_name = $1, color_code = $2 WHERE id = $3",
-						colorData.Name, colorData.Code, colorID)
+					_, err = tx.Exec(
+						"UPDATE product_colors SET color_name = $1, color_code = $2 WHERE id = $3",
+						colorData.Name, colorData.Code, colorID,
+					)
 					if err != nil {
 						fmt.Printf("Error updating color: %v\n", err)
 						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update color"})
@@ -713,30 +777,75 @@ func UpdateProduct(c *gin.Context) {
 					colorsToKeep[colorID] = true
 					fmt.Printf("Updated existing color: %s\n", colorID)
 				} else {
-					// Color ID doesn't exist, create new one
+					// Color ID doesn't exist, but there might be an existing color with same name → reuse it
+					err = tx.QueryRow(
+						"SELECT id FROM product_colors WHERE product_model_id = $1 AND color_name = $2 LIMIT 1",
+						productID, colorData.Name,
+					).Scan(&colorID)
+					if err == nil {
+						// Reuse existing color by name
+						_, err = tx.Exec(
+							"UPDATE product_colors SET color_name = $1, color_code = $2 WHERE id = $3",
+							colorData.Name, colorData.Code, colorID,
+						)
+						if err != nil {
+							fmt.Printf("Error updating color (by name): %v\n", err)
+							c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update color"})
+							return
+						}
+						colorsToKeep[colorID] = true
+						fmt.Printf("Reused existing color by name: %s for product %s\n", colorID, productID)
+					} else {
+						// Truly new color
+						colorID = uuid.New().String()
+						_, err = tx.Exec(
+							"INSERT INTO product_colors (id, product_model_id, color_name, color_code, created_at) VALUES ($1, $2, $3, $4, now())",
+							colorID, productID, colorData.Name, colorData.Code,
+						)
+						if err != nil {
+							fmt.Printf("Error creating color: %v\n", err)
+							c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create color"})
+							return
+						}
+						colorsToKeep[colorID] = true
+						fmt.Printf("Created new color (ID not found): %s for product %s\n", colorID, productID)
+					}
+				}
+			} else {
+				// No valid ID → try to reuse existing color by name to avoid duplicates
+				err = tx.QueryRow(
+					"SELECT id FROM product_colors WHERE product_model_id = $1 AND color_name = $2 LIMIT 1",
+					productID, colorData.Name,
+				).Scan(&colorID)
+
+				if err == nil {
+					// Reuse existing color (update properties)
+					_, err = tx.Exec(
+						"UPDATE product_colors SET color_name = $1, color_code = $2 WHERE id = $3",
+						colorData.Name, colorData.Code, colorID,
+					)
+					if err != nil {
+						fmt.Printf("Error updating existing color by name: %v\n", err)
+						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update color"})
+						return
+					}
+					colorsToKeep[colorID] = true
+					fmt.Printf("Reused existing color by name (no ID): %s for product %s\n", colorID, productID)
+				} else {
+					// Truly new color
 					colorID = uuid.New().String()
-					_, err = tx.Exec("INSERT INTO product_colors (id, product_model_id, color_name, color_code, created_at) VALUES ($1, $2, $3, $4, now())",
-						colorID, productID, colorData.Name, colorData.Code)
+					_, err = tx.Exec(
+						"INSERT INTO product_colors (id, product_model_id, color_name, color_code, created_at) VALUES ($1, $2, $3, $4, now())",
+						colorID, productID, colorData.Name, colorData.Code,
+					)
 					if err != nil {
 						fmt.Printf("Error creating color: %v\n", err)
 						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create color"})
 						return
 					}
 					colorsToKeep[colorID] = true
-					fmt.Printf("Created new color (ID not found): %s for product %s\n", colorID, productID)
+					fmt.Printf("Created new color: %s for product %s\n", colorID, productID)
 				}
-			} else {
-				// No valid ID, create new color
-				colorID = uuid.New().String()
-				_, err = tx.Exec("INSERT INTO product_colors (id, product_model_id, color_name, color_code, created_at) VALUES ($1, $2, $3, $4, now())",
-					colorID, productID, colorData.Name, colorData.Code)
-				if err != nil {
-					fmt.Printf("Error creating color: %v\n", err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create color"})
-					return
-				}
-				colorsToKeep[colorID] = true
-				fmt.Printf("Created new color: %s for product %s\n", colorID, productID)
 			}
 
 			// Handle images for this color
@@ -775,25 +884,105 @@ func UpdateProduct(c *gin.Context) {
 			} else {
 				fmt.Printf("No images provided for color %s\n", colorID)
 			}
+
+			// Assign canonical colors for matching (if provided)
+			if len(colorData.CanonicalColorIDs) > 0 {
+				// Delete existing canonical color matches for this product color
+				_, err = tx.Exec("DELETE FROM product_color_canonical_matches WHERE product_color_id = $1", colorID)
+				if err != nil {
+					fmt.Printf("Warning: Failed to clear existing canonical color matches for color %s: %v\n", colorID, err)
+				}
+
+				// Insert new canonical color matches
+				for _, canonicalIDStr := range colorData.CanonicalColorIDs {
+					canonicalID, err := uuid.Parse(canonicalIDStr)
+					if err != nil {
+						fmt.Printf("Warning: Invalid canonical color ID %s: %v\n", canonicalIDStr, err)
+						continue
+					}
+					_, err = tx.Exec(`
+						INSERT INTO product_color_canonical_matches (id, product_color_id, canonical_color_id, created_at)
+						VALUES (gen_random_uuid(), $1, $2, now())
+						ON CONFLICT (product_color_id, canonical_color_id) DO NOTHING
+					`, colorID, canonicalID)
+					if err != nil {
+						fmt.Printf("Warning: Failed to assign canonical color %s to product color %s: %v\n", canonicalIDStr, colorID, err)
+					}
+				}
+			}
 		}
 		
 		// Delete colors that are no longer needed
 		for _, existingColorID := range existingColors {
 			if !colorsToKeep[existingColorID] {
-				fmt.Printf("Deleting unused color: %s\n", existingColorID)
+				fmt.Printf("Checking if color %s can be deleted\n", existingColorID)
+				
+				// Check if color has SKUs that are in cart_items
+				var hasCartItems bool
+				checkQuery := `SELECT EXISTS(
+					SELECT 1 FROM cart_items ci
+					JOIN skus s ON ci.sku_id = s.id
+					WHERE s.product_color_id = $1
+				)`
+				err = tx.QueryRow(checkQuery, existingColorID).Scan(&hasCartItems)
+				if err != nil {
+					fmt.Printf("Error checking cart items for color %s: %v\n", existingColorID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check color dependencies"})
+					return
+				}
+				
+				if hasCartItems {
+					fmt.Printf("Skipping deletion of color %s - has SKUs in cart_items\n", existingColorID)
+					continue
+				}
+				
 				// Delete images first
 				_, err = tx.Exec("DELETE FROM product_images WHERE product_color_id = $1", existingColorID)
 				if err != nil {
 					fmt.Printf("Error deleting images for color %s: %v\n", existingColorID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete color images"})
+					return
 				}
-				// Delete color
+				
+				// Delete prices and inventory for SKUs before deleting SKUs
+				_, err = tx.Exec("DELETE FROM prices WHERE sku_id IN (SELECT id FROM skus WHERE product_color_id = $1)", existingColorID)
+				if err != nil {
+					fmt.Printf("Error deleting prices for color %s: %v\n", existingColorID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete color prices"})
+					return
+				}
+				
+				_, err = tx.Exec("DELETE FROM inventory WHERE sku_id IN (SELECT id FROM skus WHERE product_color_id = $1)", existingColorID)
+				if err != nil {
+					fmt.Printf("Error deleting inventory for color %s: %v\n", existingColorID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete color inventory"})
+					return
+				}
+				
+				// Delete SKUs first (they reference the color)
+				_, err = tx.Exec("DELETE FROM skus WHERE product_color_id = $1", existingColorID)
+				if err != nil {
+					fmt.Printf("Error deleting SKUs for color %s: %v\n", existingColorID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete color SKUs"})
+					return
+				}
+				
+				// Now delete the color
 				_, err = tx.Exec("DELETE FROM product_colors WHERE id = $1", existingColorID)
 				if err != nil {
 					fmt.Printf("Error deleting color %s: %v\n", existingColorID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete color"})
+					return
 				}
+				
+				fmt.Printf("Successfully deleted unused color: %s\n", existingColorID)
 			}
 		}
 	}
+
+	// Track SKUs that went from 0 to >0 stock for notification triggers AFTER commit
+	// Declare outside SKU block so it's accessible after transaction commit
+	skusBackInStock := make(map[string]bool)
 
 	// Handle SKUs if provided
 	if len(req.SKUs) > 0 {
@@ -819,201 +1008,283 @@ func UpdateProduct(c *gin.Context) {
 		
 		for _, skuData := range req.SKUs {
 			var skuID string
-			
-			// Check if SKU ID is valid UUID and exists
-			if skuData.ID != "" && len(skuData.ID) == 36 {
-				// Check if this SKU exists for this product
-				err = tx.QueryRow("SELECT id FROM skus WHERE id = $1 AND product_model_id = $2", 
-					skuData.ID, productID).Scan(&skuID)
+
+			// Normalize size
+			skuSize := skuData.Size
+			if skuSize == "" {
+				skuSize = "One Size"
+			}
+
+			// Try to load by explicit ID (update flow)
+			hasValidID := skuData.ID != "" && len(skuData.ID) == 36
+			var oldStock int
+			if hasValidID {
+				err = tx.QueryRow(
+					"SELECT id FROM skus WHERE id = $1 AND product_model_id = $2",
+					skuData.ID, productID,
+				).Scan(&skuID)
 				
+				// Get old stock BEFORE updating
 				if err == nil {
-					// SKU exists, update it
-					// Handle empty size for products like sunglasses
-					skuSize := skuData.Size
-					if skuSize == "" {
-						skuSize = "One Size"
-					}
-					
-					// Update SKU
-					_, err = tx.Exec("UPDATE skus SET size = $1, size_normalized = $2 WHERE id = $3",
-						skuSize, normalizeSize(skuSize), skuID)
-					if err != nil {
-						fmt.Printf("Error updating SKU: %v\n", err)
-						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update SKU"})
-						return
-					}
-					
-					// Update inventory
-					_, err = tx.Exec("UPDATE inventory SET available = $1 WHERE sku_id = $2",
-						skuData.Inventory, skuID)
-					if err != nil {
-						fmt.Printf("Error updating inventory: %v\n", err)
-						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update inventory"})
-						return
-					}
-					
-					// Update price
-					salePrice := skuData.SalePrice
-					if salePrice == 0 {
-						salePrice = skuData.Price
-					}
-					_, err = tx.Exec("UPDATE prices SET list_price = $1, sale_price = $2 WHERE sku_id = $3",
-						skuData.Price, salePrice, skuID)
-					if err != nil {
-						fmt.Printf("Error updating price: %v\n", err)
-						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update price"})
-						return
-					}
-					
-					skusToKeep[skuID] = true
-					fmt.Printf("Updated existing SKU: %s\n", skuID)
-				} else {
-					// SKU ID doesn't exist, create new one
-					skuID = uuid.New().String()
-					
-					// Find color ID by name
-					var colorID string
-					err = tx.QueryRow("SELECT id FROM product_colors WHERE product_model_id = $1 AND color_name = $2", 
-						productID, skuData.ColorName).Scan(&colorID)
-					if err != nil {
-						fmt.Printf("Error finding color %s for SKU: %v\n", skuData.ColorName, err)
-						c.JSON(http.StatusInternalServerError, gin.H{"error": "Color not found: " + skuData.ColorName})
-						return
-					}
-					
-				// Handle empty size for products like sunglasses
-				skuSize := skuData.Size
-				if skuSize == "" {
-					skuSize = "One Size"
+					tx.QueryRow(
+						"SELECT COALESCE(available, 0) FROM inventory WHERE sku_id = $1",
+						skuID,
+					).Scan(&oldStock)
 				}
-				
-				// Generate SKU code and EAN
-				skuCode := generateSKUCode("PROD", skuData.ColorName, skuSize)
-				eanCode := generateEANCode("PROD", skuData.ColorName, skuSize)
-				
-				// Create SKU
-				_, err = tx.Exec("INSERT INTO skus (id, product_model_id, product_color_id, sku_code, ean, size, size_normalized, attributes, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())",
-					skuID, productID, colorID, skuCode, eanCode, skuSize, normalizeSize(skuSize), "{}")
-					if err != nil {
-						fmt.Printf("Error creating SKU: %v\n", err)
-						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create SKU"})
-						return
-					}
-					
-					// Create inventory
-					_, err = tx.Exec("INSERT INTO inventory (sku_id, available, reserved, updated_at) VALUES ($1, $2, $3, now())",
-						skuID, skuData.Inventory, 0)
-					if err != nil {
-						fmt.Printf("Error creating inventory: %v\n", err)
-						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create inventory"})
-						return
-					}
-					
-					// Create price
-					priceID := uuid.New().String()
-					salePrice := skuData.SalePrice
-					if salePrice == 0 {
-						salePrice = skuData.Price
-					}
-					_, err = tx.Exec("INSERT INTO prices (id, sku_id, currency, list_price, sale_price, created_at) VALUES ($1, $2, $3, $4, $5, now())",
-						priceID, skuID, "MRO", skuData.Price, salePrice)
-					if err != nil {
-						fmt.Printf("Error creating price: %v\n", err)
-						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create price"})
-						return
-					}
-					
-					skusToKeep[skuID] = true
-					fmt.Printf("Created new SKU: %s for color %s\n", skuID, skuData.ColorName)
-				}
-			} else {
-				// No valid ID, create new SKU
-				skuID = uuid.New().String()
-				
-				// Find color ID by name
-				var colorID string
-				err = tx.QueryRow("SELECT id FROM product_colors WHERE product_model_id = $1 AND color_name = $2", 
-					productID, skuData.ColorName).Scan(&colorID)
+			}
+
+			if hasValidID && err == nil {
+				// Existing SKU: update basic fields
+				_, err = tx.Exec(
+					"UPDATE skus SET size = $1, size_normalized = $2 WHERE id = $3",
+					skuSize, normalizeSize(skuSize), skuID,
+				)
 				if err != nil {
-					fmt.Printf("Error finding color %s for SKU: %v\n", skuData.ColorName, err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "Color not found: " + skuData.ColorName})
+					fmt.Printf("Error updating SKU: %v\n", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update SKU"})
 					return
 				}
-				
-				// Handle empty size for products like sunglasses
-				skuSize := skuData.Size
-				if skuSize == "" {
-					skuSize = "One Size"
-				}
-				
-				// Generate SKU code and EAN
-				skuCode := generateSKUCode("PROD", skuData.ColorName, skuSize)
-				eanCode := generateEANCode("PROD", skuData.ColorName, skuSize)
-				
-				// Create SKU
-				_, err = tx.Exec("INSERT INTO skus (id, product_model_id, product_color_id, sku_code, ean, size, size_normalized, attributes, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())",
-					skuID, productID, colorID, skuCode, eanCode, skuSize, normalizeSize(skuSize), "{}")
+
+				// Update inventory
+				_, err = tx.Exec(
+					"UPDATE inventory SET available = $1 WHERE sku_id = $2",
+					skuData.Inventory, skuID,
+				)
 				if err != nil {
-					fmt.Printf("Error creating SKU: %v\n", err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create SKU"})
+					fmt.Printf("Error updating inventory: %v\n", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update inventory"})
 					return
 				}
-				
-				// Create inventory
-				_, err = tx.Exec("INSERT INTO inventory (sku_id, available, reserved, updated_at) VALUES ($1, $2, $3, now())",
-					skuID, skuData.Inventory, 0)
-				if err != nil {
-					fmt.Printf("Error creating inventory: %v\n", err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create inventory"})
-					return
-				}
-				
-				// Create price
-				priceID := uuid.New().String()
+
+				// Update price
 				salePrice := skuData.SalePrice
 				if salePrice == 0 {
 					salePrice = skuData.Price
 				}
-				_, err = tx.Exec("INSERT INTO prices (id, sku_id, currency, list_price, sale_price, created_at) VALUES ($1, $2, $3, $4, $5, now())",
-					priceID, skuID, "MRO", skuData.Price, salePrice)
+				_, err = tx.Exec(
+					"UPDATE prices SET list_price = $1, sale_price = $2 WHERE sku_id = $3",
+					skuData.Price, salePrice, skuID,
+				)
 				if err != nil {
-					fmt.Printf("Error creating price: %v\n", err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create price"})
+					fmt.Printf("Error updating price: %v\n", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update price"})
 					return
 				}
-				
+
+				// Track if stock went from 0 to >0 (for notifications AFTER commit)
+				if oldStock == 0 && skuData.Inventory > 0 {
+					skusBackInStock[skuID] = true
+					fmt.Printf("📦 SKU %s went from 0 to %d stock - will notify subscribers after commit\n", skuID, skuData.Inventory)
+				}
+
 				skusToKeep[skuID] = true
-				fmt.Printf("Created new SKU: %s for color %s\n", skuID, skuData.ColorName)
+				fmt.Printf("Updated existing SKU: %s\n", skuID)
+				continue
 			}
+
+			// From here on: create or reuse by (color, size)
+			// Resolve color ID
+			var colorID string
+			err = tx.QueryRow(
+				"SELECT id FROM product_colors WHERE product_model_id = $1 AND color_name = $2",
+				productID, skuData.ColorName,
+			).Scan(&colorID)
+			if err != nil {
+				fmt.Printf("Error finding color %s for SKU: %v\n", skuData.ColorName, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Color not found: " + skuData.ColorName})
+				return
+			}
+
+			// Check if a SKU with same (product, color, size) already exists
+			var existingSameSKU string
+			err = tx.QueryRow(
+				"SELECT id FROM skus WHERE product_model_id = $1 AND product_color_id = $2 AND size = $3 LIMIT 1",
+				productID, colorID, skuSize,
+			).Scan(&existingSameSKU)
+
+			if err == nil && existingSameSKU != "" {
+				// Reuse existing SKU: just update inventory and price
+				skuID = existingSameSKU
+
+				// Get old stock BEFORE updating
+				var oldStock int
+				tx.QueryRow(
+					"SELECT COALESCE(available, 0) FROM inventory WHERE sku_id = $1",
+					skuID,
+				).Scan(&oldStock)
+
+				_, err = tx.Exec(
+					"UPDATE inventory SET available = $1 WHERE sku_id = $2",
+					skuData.Inventory, skuID,
+				)
+				if err != nil {
+					fmt.Printf("Error updating inventory for existing same SKU: %v\n", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update inventory"})
+					return
+				}
+
+				salePrice := skuData.SalePrice
+				if salePrice == 0 {
+					salePrice = skuData.Price
+				}
+				_, err = tx.Exec(
+					"UPDATE prices SET list_price = $1, sale_price = $2 WHERE sku_id = $3",
+					skuData.Price, salePrice, skuID,
+				)
+				if err != nil {
+					fmt.Printf("Error updating price for existing same SKU: %v\n", err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update price"})
+					return
+				}
+
+				// Track if stock went from 0 to >0 (for notifications AFTER commit)
+				if oldStock == 0 && skuData.Inventory > 0 {
+					skusBackInStock[skuID] = true
+					fmt.Printf("📦 SKU %s went from 0 to %d stock - will notify subscribers after commit\n", skuID, skuData.Inventory)
+				}
+
+				skusToKeep[skuID] = true
+				fmt.Printf("Reused existing SKU (same color+size): %s for color %s\n", skuID, skuData.ColorName)
+				continue
+			}
+
+			// No existing SKU with same (color, size): create a brand new one
+			skuID = uuid.New().String()
+
+			skuCode := generateSKUCode(productCode, skuData.ColorName, skuSize)
+			eanCode := generateEANCode(productCode, skuData.ColorName, skuSize)
+
+			_, err = tx.Exec(
+				"INSERT INTO skus (id, product_model_id, product_color_id, sku_code, ean, size, size_normalized, attributes, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())",
+				skuID, productID, colorID, skuCode, eanCode, skuSize, normalizeSize(skuSize), "{}",
+			)
+			if err != nil {
+				fmt.Printf("Error creating SKU: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create SKU", "details": err.Error()})
+				return
+			}
+
+			_, err = tx.Exec(
+				"INSERT INTO inventory (sku_id, available, reserved, updated_at) VALUES ($1, $2, $3, now())",
+				skuID, skuData.Inventory, 0,
+			)
+			if err != nil {
+				fmt.Printf("Error creating inventory: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create inventory"})
+				return
+			}
+
+			priceID := uuid.New().String()
+			salePrice := skuData.SalePrice
+			if salePrice == 0 {
+				salePrice = skuData.Price
+			}
+			_, err = tx.Exec(
+				"INSERT INTO prices (id, sku_id, currency, list_price, sale_price, created_at) VALUES ($1, $2, $3, $4, $5, now())",
+				priceID, skuID, "MRO", skuData.Price, salePrice,
+			)
+			if err != nil {
+				fmt.Printf("Error creating price: %v\n", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create price"})
+				return
+			}
+
+			// New SKU with stock: track for notifications AFTER commit (since it's new, oldStock = 0)
+			if skuData.Inventory > 0 {
+				skusBackInStock[skuID] = true
+				fmt.Printf("📦 New SKU %s created with %d stock - will notify subscribers after commit\n", skuID, skuData.Inventory)
+			}
+
+			skusToKeep[skuID] = true
+			fmt.Printf("Created new SKU: %s for color %s\n", skuID, skuData.ColorName)
 		}
 		
 		// Delete SKUs that are no longer needed
 		for _, existingSKUID := range existingSKUs {
 			if !skusToKeep[existingSKUID] {
+				fmt.Printf("Checking if SKU %s can be deleted\n", existingSKUID)
+				
+				// Check if SKU has order_items
+				var hasOrderItems bool
+				checkQuery := `SELECT EXISTS(SELECT 1 FROM order_items WHERE sku_id = $1)`
+				err = tx.QueryRow(checkQuery, existingSKUID).Scan(&hasOrderItems)
+				if err != nil {
+					fmt.Printf("Error checking order items for SKU %s: %v\n", existingSKUID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check SKU dependencies"})
+					return
+				}
+				
+				if hasOrderItems {
+					fmt.Printf("Skipping deletion of SKU %s - has order_items\n", existingSKUID)
+					continue
+				}
+				
+				// Check if SKU has cart_items (IMPORTANT: prevent foreign key violation)
+				var hasCartItems bool
+				cartCheckQuery := `SELECT EXISTS(SELECT 1 FROM cart_items WHERE sku_id = $1)`
+				err = tx.QueryRow(cartCheckQuery, existingSKUID).Scan(&hasCartItems)
+				if err != nil {
+					fmt.Printf("Error checking cart items for SKU %s: %v\n", existingSKUID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check SKU cart dependencies"})
+					return
+				}
+				
+				if hasCartItems {
+					fmt.Printf("Skipping deletion of SKU %s - has cart_items\n", existingSKUID)
+					continue
+				}
+				
 				fmt.Printf("Deleting unused SKU: %s\n", existingSKUID)
 				// Delete price first
 				_, err = tx.Exec("DELETE FROM prices WHERE sku_id = $1", existingSKUID)
 				if err != nil {
 					fmt.Printf("Error deleting price for SKU %s: %v\n", existingSKUID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete SKU price"})
+					return
 				}
 				// Delete inventory
 				_, err = tx.Exec("DELETE FROM inventory WHERE sku_id = $1", existingSKUID)
 				if err != nil {
 					fmt.Printf("Error deleting inventory for SKU %s: %v\n", existingSKUID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete SKU inventory"})
+					return
 				}
 				// Delete SKU
 				_, err = tx.Exec("DELETE FROM skus WHERE id = $1", existingSKUID)
 				if err != nil {
 					fmt.Printf("Error deleting SKU %s: %v\n", existingSKUID, err)
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete SKU"})
+					return
 				}
+				
+				fmt.Printf("Successfully deleted unused SKU: %s\n", existingSKUID)
 			}
 		}
 	}
 
-	// Commit transaction
+	// Commit transaction FIRST
 	if err = tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
 		return
+	}
+
+	// AFTER commit: trigger back-in-stock notifications for SKUs that went from 0 to >0
+	if len(skusBackInStock) > 0 {
+		fmt.Printf("🔔 Triggering back-in-stock notifications for %d SKU(s)\n", len(skusBackInStock))
+		for skuIDStr := range skusBackInStock {
+			skuUUID, parseErr := uuid.Parse(skuIDStr)
+			if parseErr != nil {
+				fmt.Printf("⚠️ Invalid SKU ID for notification: %s\n", skuIDStr)
+				continue
+			}
+			
+			// Now trigger notifications (database is committed, so it will see the new stock)
+			if notifyErr := TriggerNotificationsForProduct(productUUID, &skuUUID); notifyErr != nil {
+				fmt.Printf("⚠️ Failed to trigger back-in-stock notifications for SKU %s: %v\n", skuIDStr, notifyErr)
+			} else {
+				fmt.Printf("✅ Successfully triggered notifications for SKU %s\n", skuIDStr)
+			}
+		}
 	}
 
 	fmt.Printf("Product %s updated successfully with images and SKUs\n", productID)

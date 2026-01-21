@@ -12,6 +12,7 @@ type ProductView struct {
 	ProductID            uuid.UUID `json:"product_id"`
 	UserID               uuid.NullUUID `json:"user_id"`               // Nullable for anonymous users
 	AnonymousSessionID   string    `json:"anonymous_session_id"`     // For unauthenticated users
+	PhoneNumber          string    `json:"phone_number"`              // For tracking anonymous users by phone
 	ViewTimestamp        time.Time `json:"view_timestamp"`
 	IPAddress            string    `json:"ip_address"`
 	UserAgent            string    `json:"user_agent"`
@@ -38,11 +39,22 @@ func (ProductView) CreateTableSQL() string {
 		product_id UUID NOT NULL REFERENCES product_models(id) ON DELETE CASCADE,
 		user_id UUID REFERENCES users(id) ON DELETE SET NULL,
 		anonymous_session_id VARCHAR(255),
+		phone_number VARCHAR(20),
 		view_timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 		ip_address INET,
 		user_agent TEXT,
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 	);
+	
+	-- Add phone_number column if it doesn't exist (migration support)
+	DO $$ 
+	BEGIN 
+		IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+		               WHERE table_name='product_views' AND column_name='phone_number') THEN
+			ALTER TABLE product_views ADD COLUMN phone_number VARCHAR(20);
+			CREATE INDEX IF NOT EXISTS idx_product_views_phone_number ON product_views(phone_number);
+		END IF;
+	END $$;
 	
 	-- Indexes for performance
 	CREATE INDEX IF NOT EXISTS idx_product_views_product_id ON product_views(product_id);

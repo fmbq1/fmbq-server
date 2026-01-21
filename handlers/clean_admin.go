@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -109,16 +110,46 @@ func CleanAdminLogin(c *gin.Context) {
 		return
 	}
 
-	// Generate token
-	token, err := generateJWT(userID, phone)
+	// Generate permanent UUID-based token (same as regular user login)
+	permanentToken := uuid.New().String()
+	
+	fmt.Printf("🔑 Generated admin token for user %s: %s (length: %d)\n", userID, permanentToken, len(permanentToken))
+	
+	// Store token in database
+	userUUID, err := uuid.Parse(userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token error"})
+		fmt.Printf("❌ Failed to parse user ID: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid user ID"})
 		return
+	}
+	
+	tokenID := uuid.New()
+	insertTokenQuery := `INSERT INTO user_tokens (id, user_id, token, created_at, last_used, revoked)
+	                     VALUES ($1, $2, $3, $4, $5, $6)`
+	result, err := DB.Exec(insertTokenQuery,
+		tokenID, userUUID, permanentToken, time.Now(), time.Now(), false)
+	if err != nil {
+		fmt.Printf("❌ Failed to insert admin token: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create token"})
+		return
+	}
+	
+	rowsAffected, _ := result.RowsAffected()
+	fmt.Printf("✅ Admin token inserted successfully. Rows affected: %d\n", rowsAffected)
+	
+	// Verify token was inserted
+	var verifyToken string
+	verifyQuery := `SELECT token FROM user_tokens WHERE token = $1 AND revoked = false`
+	err = DB.QueryRow(verifyQuery, permanentToken).Scan(&verifyToken)
+	if err != nil {
+		fmt.Printf("⚠️ WARNING: Admin token verification failed after insert: %v\n", err)
+	} else {
+		fmt.Printf("✅ Admin token verified in database: %s\n", verifyToken[:20] + "...")
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Login successful",
-		"token":   token,
+		"token":   permanentToken,
 		"user": gin.H{
 			"id":        userID,
 			"phone":     phone,

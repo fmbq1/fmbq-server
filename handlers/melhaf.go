@@ -154,19 +154,20 @@ func AdminCreateMelhafCollection(c *gin.Context) {
 		IsActive    bool   `json:"is_active"`
 		SortOrder   int    `json:"sort_order"`
 		Colors      []struct {
-			Name        string   `json:"name" binding:"required"`
-			NameAr      *string  `json:"name_ar"`
-			ColorCode   *string  `json:"color_code"`
-			Price       float64  `json:"price" binding:"required"`
-			Discount    *float64 `json:"discount"`
-			SortOrder   int      `json:"sort_order"`
-			IsActive    bool     `json:"is_active"`
-			Inventory   *struct {
+			Name              string   `json:"name" binding:"required"`
+			NameAr            *string  `json:"name_ar"`
+			ColorCode         *string  `json:"color_code"`
+			Price             float64  `json:"price" binding:"required"`
+			Discount          *float64 `json:"discount"`
+			SortOrder         int      `json:"sort_order"`
+			IsActive          bool     `json:"is_active"`
+			CanonicalColorIDs []string `json:"canonical_color_ids"` // For matching
+			Inventory         *struct {
 				Available    int `json:"available"`
 				Reserved     int `json:"reserved"`
 				ReorderPoint int `json:"reorder_point"`
 			} `json:"inventory"`
-		} `json:"colors" binding:"required,min=1"`
+		} `json:"colors"` // Optional - can create collection without colors, or colors separately
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -174,10 +175,7 @@ func AdminCreateMelhafCollection(c *gin.Context) {
 		return
 	}
 
-	if len(req.Colors) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Collection must have at least one color"})
-		return
-	}
+	// Colors are optional - can create empty collection and add colors later
 
 	typeID, err := uuid.Parse(req.TypeID)
 	if err != nil {
@@ -205,9 +203,10 @@ func AdminCreateMelhafCollection(c *gin.Context) {
 		return
 	}
 
-	// Create colors for this collection
+	// Create colors for this collection (if any)
 	var createdColors []map[string]interface{}
-	for _, colorData := range req.Colors {
+	if len(req.Colors) > 0 {
+		for _, colorData := range req.Colors {
 		colorID := uuid.New()
 		
 		// Auto-generate EAN code (13 digits)
@@ -242,11 +241,31 @@ func AdminCreateMelhafCollection(c *gin.Context) {
 			fmt.Printf("Warning: Failed to create inventory for color %s: %v\n", colorData.Name, err)
 		}
 
-		createdColors = append(createdColors, map[string]interface{}{
-			"id":   colorID.String(),
-			"name": colorData.Name,
-			"ean":  eanCode,
-		})
+		// Assign canonical colors for matching
+		if len(colorData.CanonicalColorIDs) > 0 {
+			for _, canonicalIDStr := range colorData.CanonicalColorIDs {
+				canonicalID, err := uuid.Parse(canonicalIDStr)
+				if err != nil {
+					fmt.Printf("Warning: Invalid canonical color ID %s: %v\n", canonicalIDStr, err)
+					continue
+				}
+				_, err = tx.Exec(`
+					INSERT INTO melhaf_color_canonical_matches (id, melhaf_color_id, canonical_color_id, created_at)
+					VALUES (gen_random_uuid(), $1, $2, now())
+					ON CONFLICT (melhaf_color_id, canonical_color_id) DO NOTHING
+				`, colorID, canonicalID)
+				if err != nil {
+					fmt.Printf("Warning: Failed to assign canonical color %s to Melhaf color %s: %v\n", canonicalIDStr, colorData.Name, err)
+				}
+			}
+		}
+
+			createdColors = append(createdColors, map[string]interface{}{
+				"id":   colorID.String(),
+				"name": colorData.Name,
+				"ean":  eanCode,
+			})
+		}
 	}
 
 	// Commit transaction
@@ -422,8 +441,11 @@ func AdminGetMelhafColors(c *gin.Context) {
 	query := `
 		SELECT mc.id, mc.collection_id, mc.name, mc.name_ar, mc.color_code, 
 		       mc.price, mc.discount, mc.ean, mc.is_active, mc.sort_order,
-		       mc.created_at, mc.updated_at
+		       mc.created_at, mc.updated_at,
+		       mcol.name as collection_name,
+		       COALESCE((SELECT url FROM melhaf_color_images WHERE color_id = mc.id ORDER BY position LIMIT 1), '') as image_url
 		FROM melhaf_colors mc
+		LEFT JOIN melhaf_collections mcol ON mc.collection_id = mcol.id
 	`
 	var rows *sql.Rows
 	var err error
@@ -451,24 +473,28 @@ func AdminGetMelhafColors(c *gin.Context) {
 		var isActive bool
 		var sortOrder int
 		var createdAt, updatedAt time.Time
+		var collectionName sql.NullString
+		var imageURL sql.NullString
 
-		if err := rows.Scan(&id, &collectionID, &name, &nameAr, &colorCode, &price, &discount, &ean, &isActive, &sortOrder, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&id, &collectionID, &name, &nameAr, &colorCode, &price, &discount, &ean, &isActive, &sortOrder, &createdAt, &updatedAt, &collectionName, &imageURL); err != nil {
 			continue
 		}
 
 		colors = append(colors, map[string]interface{}{
-			"id":            id.String(),
-			"collection_id": collectionID.String(),
-			"name":          name,
-			"name_ar":       nameAr.String,
-			"color_code":    colorCode.String,
-			"price":         price,
-			"discount":      discount.Float64,
-			"ean":           ean.String,
-			"is_active":     isActive,
-			"sort_order":    sortOrder,
-			"created_at":    createdAt,
-			"updated_at":    updatedAt,
+			"id":              id.String(),
+			"collection_id":   collectionID.String(),
+			"name":            name,
+			"name_ar":         nameAr.String,
+			"color_code":      colorCode.String,
+			"price":           price,
+			"discount":        discount.Float64,
+			"ean":             ean.String,
+			"is_active":       isActive,
+			"sort_order":      sortOrder,
+			"created_at":      createdAt,
+			"updated_at":      updatedAt,
+			"collection_name": collectionName.String,
+			"image_url":       imageURL.String,
 		})
 	}
 
@@ -476,18 +502,19 @@ func AdminGetMelhafColors(c *gin.Context) {
 }
 
 // AdminCreateMelhafColor handles POST /api/v1/admin/melhaf/colors
-// This is for adding individual colors to existing collections
+// This is for adding individual colors to existing collections OR creating standalone Melhafs
 func AdminCreateMelhafColor(c *gin.Context) {
 	var req struct {
-		CollectionID string   `json:"collection_id" binding:"required"`
-		Name          string   `json:"name" binding:"required"`
-		NameAr        *string  `json:"name_ar"`
-		ColorCode     *string  `json:"color_code"`
-		Price         float64  `json:"price" binding:"required"`
-		Discount      *float64 `json:"discount"`
-		IsActive      bool     `json:"is_active"`
-		SortOrder     int      `json:"sort_order"`
-		Inventory     *struct {
+		CollectionID      *string  `json:"collection_id"` // Optional - allows standalone Melhafs
+		Name              string   `json:"name" binding:"required"`
+		NameAr            *string  `json:"name_ar"`
+		ColorCode         *string  `json:"color_code"`
+		Price             float64  `json:"price" binding:"required"`
+		Discount          *float64 `json:"discount"`
+		IsActive          bool     `json:"is_active"`
+		SortOrder         int      `json:"sort_order"`
+		CanonicalColorIDs []string `json:"canonical_color_ids"` // For matching
+		Inventory         *struct {
 			Available    int `json:"available"`
 			Reserved     int `json:"reserved"`
 			ReorderPoint int `json:"reorder_point"`
@@ -499,18 +526,25 @@ func AdminCreateMelhafColor(c *gin.Context) {
 		return
 	}
 
-	collectionID, err := uuid.Parse(req.CollectionID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid collection_id"})
-		return
-	}
-
-	// Get collection name for EAN generation
+	var collectionID *uuid.UUID
 	var collectionName string
-	err = database.Database.QueryRow(`SELECT name FROM melhaf_collections WHERE id = $1`, collectionID).Scan(&collectionName)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Collection not found"})
-		return
+	if req.CollectionID != nil && *req.CollectionID != "" {
+		parsedID, err := uuid.Parse(*req.CollectionID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid collection_id"})
+			return
+		}
+		collectionID = &parsedID
+
+		// Get collection name for EAN generation
+		err = database.Database.QueryRow(`SELECT name FROM melhaf_collections WHERE id = $1`, collectionID).Scan(&collectionName)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Collection not found"})
+			return
+		}
+	} else {
+		// Standalone Melhaf - use color name for EAN
+		collectionName = req.Name
 	}
 
 	// Auto-generate EAN code (13 digits)
@@ -552,6 +586,25 @@ func AdminCreateMelhafColor(c *gin.Context) {
 
 	if err != nil {
 		fmt.Printf("Warning: Failed to create inventory entry: %v\n", err)
+	}
+
+	// Assign canonical colors for matching
+	if len(req.CanonicalColorIDs) > 0 {
+		for _, canonicalIDStr := range req.CanonicalColorIDs {
+			canonicalID, err := uuid.Parse(canonicalIDStr)
+			if err != nil {
+				fmt.Printf("Warning: Invalid canonical color ID %s: %v\n", canonicalIDStr, err)
+				continue
+			}
+			_, err = tx.Exec(`
+				INSERT INTO melhaf_color_canonical_matches (id, melhaf_color_id, canonical_color_id, created_at)
+				VALUES (gen_random_uuid(), $1, $2, now())
+				ON CONFLICT (melhaf_color_id, canonical_color_id) DO NOTHING
+			`, colorID, canonicalID)
+			if err != nil {
+				fmt.Printf("Warning: Failed to assign canonical color %s to Melhaf color %s: %v\n", canonicalIDStr, req.Name, err)
+			}
+		}
 	}
 
 	// Commit transaction
@@ -845,6 +898,361 @@ func GetMelhafVideos(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": videos})
+}
+
+// GetMelhafasForHome handles GET /api/v1/public/melhafas/home
+// Returns individual Melhafs - standalone or from collections
+// A Melhaf is a color variant - can be standalone (no collection) or part of a collection
+func GetMelhafasForHome(c *gin.Context) {
+	limit := c.DefaultQuery("limit", "20")
+	limitInt, _ := strconv.Atoi(limit)
+	if limitInt > 50 {
+		limitInt = 50
+	}
+
+	// Get active Melhaf colors (individual Melhafs)
+	// If collection_id is NULL, it's a standalone Melhaf
+	// If collection_id exists, use collection name as the Melhaf name
+	query := `
+		SELECT 
+			mc.id as melhaf_id,
+			mc.name as color_name,
+			mc.name_ar,
+			mc.color_code,
+			mc.price,
+			mc.discount,
+			mc.collection_id,
+			COALESCE(mcol.name, mc.name) as melhaf_name,
+			mcol.description,
+			COALESCE(mt.name, '') as type_name,
+			COALESCE((SELECT url FROM melhaf_color_images WHERE color_id = mc.id ORDER BY position LIMIT 1), '') as image_url
+		FROM melhaf_colors mc
+		LEFT JOIN melhaf_collections mcol ON mc.collection_id = mcol.id
+		LEFT JOIN melhaf_types mt ON mcol.type_id = mt.id
+		WHERE mc.is_active = TRUE
+		AND (mcol.id IS NULL OR mcol.is_active = TRUE)
+		AND (mt.id IS NULL OR mt.is_active = TRUE)
+		ORDER BY mc.sort_order, mc.created_at DESC
+		LIMIT $1
+	`
+	rows, err := database.Database.Query(query, limitInt)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch Melhafas"})
+		return
+	}
+	defer rows.Close()
+
+	var melhafas []map[string]interface{}
+	for rows.Next() {
+		var melhafID uuid.UUID
+		var colorName string
+		var nameAr, colorCode sql.NullString
+		var price float64
+		var discount sql.NullFloat64
+		var collectionID sql.NullString
+		var melhafName string
+		var description sql.NullString
+		var typeName string
+		var imageURL string
+
+		if err := rows.Scan(&melhafID, &colorName, &nameAr, &colorCode, &price, &discount, &collectionID, &melhafName, &description, &typeName, &imageURL); err != nil {
+			continue
+		}
+
+		// If standalone (no collection), melhaf_name is the color name
+		// If part of collection, melhaf_name is the collection name
+		if !collectionID.Valid {
+			melhafName = colorName
+		}
+
+		melhafas = append(melhafas, map[string]interface{}{
+			"id":            melhafID.String(),
+			"name":          melhafName, // This is the Melhaf name (collection name or color name if standalone)
+			"color_name":   colorName,   // This is the specific color variant name
+			"color_code":   colorCode.String,
+			"price":        price,
+			"discount":     discount.Float64,
+			"image_url":    imageURL,
+			"type_name":    typeName,
+			"description":  description.String,
+			"collection_id": collectionID.String,
+			"is_standalone": !collectionID.Valid, // Flag to indicate if it's standalone
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    melhafas,
+	})
+}
+
+// GetMelhafaDetail handles GET /api/v1/public/melhafas/:id
+// Returns a single Melhaf color with matched bags and shoes for detail screen
+func GetMelhafaDetail(c *gin.Context) {
+	colorIDStr := c.Param("id")
+	colorID, err := uuid.Parse(colorIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Melhaf ID"})
+		return
+	}
+
+	// Get Melhaf color details
+	var colorName string
+	var nameAr, colorCode sql.NullString
+	var price float64
+	var discount sql.NullFloat64
+	var collectionID sql.NullString
+	var collectionName sql.NullString
+	var description sql.NullString
+	var typeName sql.NullString
+
+	err = database.Database.QueryRow(`
+		SELECT 
+			mc.name,
+			mc.name_ar,
+			mc.color_code,
+			mc.price,
+			mc.discount,
+			mcol.id as collection_id,
+			mcol.name as collection_name,
+			mcol.description,
+			mt.name as type_name
+		FROM melhaf_colors mc
+		LEFT JOIN melhaf_collections mcol ON mc.collection_id = mcol.id
+		LEFT JOIN melhaf_types mt ON mcol.type_id = mt.id
+		WHERE mc.id = $1 AND mc.is_active = TRUE
+	`, colorID).Scan(&colorName, &nameAr, &colorCode, &price, &discount, &collectionID, &collectionName, &description, &typeName)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Melhaf not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch Melhaf"})
+		}
+		return
+	}
+
+	// Get images for this color
+	imageRows, _ := database.Database.Query(`
+		SELECT url, alt, position
+		FROM melhaf_color_images
+		WHERE color_id = $1
+		ORDER BY position
+	`, colorID)
+
+	var images []map[string]interface{}
+	for imageRows.Next() {
+		var url, alt string
+		var position int
+		if err := imageRows.Scan(&url, &alt, &position); err == nil {
+			images = append(images, map[string]interface{}{
+				"url":      url,
+				"alt":      alt,
+				"position": position,
+			})
+		}
+	}
+	imageRows.Close()
+
+	// Get all colors from the same collection (if exists) for color swatches
+	var otherColors []map[string]interface{}
+	if collectionID.Valid {
+		colorRows, _ := database.Database.Query(`
+			SELECT mc.id, mc.name, mc.color_code,
+			       COALESCE((SELECT url FROM melhaf_color_images WHERE color_id = mc.id ORDER BY position LIMIT 1), '') as image_url
+			FROM melhaf_colors mc
+			WHERE mc.collection_id = $1 AND mc.is_active = TRUE AND mc.id != $2
+			ORDER BY mc.sort_order
+		`, collectionID.String, colorID)
+
+		for colorRows.Next() {
+			var otherColorID uuid.UUID
+			var otherColorName string
+			var otherColorCode sql.NullString
+			var otherImageURL string
+			if err := colorRows.Scan(&otherColorID, &otherColorName, &otherColorCode, &otherImageURL); err == nil {
+				otherColors = append(otherColors, map[string]interface{}{
+					"id":         otherColorID.String(),
+					"name":       otherColorName,
+					"color_code": otherColorCode.String,
+					"image_url":  otherImageURL,
+				})
+			}
+		}
+		colorRows.Close()
+	}
+
+	// Get canonical colors for this Melhaf
+	canonicalRows, _ := database.Database.Query(`
+		SELECT DISTINCT cc.id, cc.internal_key, cc.name_en, cc.name_fr, cc.color_code
+		FROM canonical_colors cc
+		JOIN melhaf_color_canonical_matches mccm ON cc.id = mccm.canonical_color_id
+		WHERE mccm.melhaf_color_id = $1 AND cc.is_active = TRUE
+		ORDER BY cc.name_en
+	`, colorID)
+
+	var canonicalColors []map[string]interface{}
+	for canonicalRows.Next() {
+		var ccID uuid.UUID
+		var internalKey, nameEn, nameFr string
+		var colorCode sql.NullString
+		if err := canonicalRows.Scan(&ccID, &internalKey, &nameEn, &nameFr, &colorCode); err == nil {
+			canonicalColors = append(canonicalColors, map[string]interface{}{
+				"id":           ccID.String(),
+				"internal_key": internalKey,
+				"name_en":      nameEn,
+				"name_fr":      nameFr,
+				"color_code":   colorCode.String,
+			})
+		}
+	}
+	canonicalRows.Close()
+
+	// Find matching products (bag and shoes) - ONLY for detail screen
+	matchedBag := []map[string]interface{}{}
+	matchedShoes := []map[string]interface{}{}
+	bags, shoes, err := services.FindMatchingProducts(colorID, 1, 1)
+	if err != nil {
+		fmt.Printf("Warning: Failed to find matching products for Melhaf %s: %v\n", colorID.String(), err)
+	} else {
+		if bags != nil {
+			matchedBag = bags
+		}
+		if shoes != nil {
+			matchedShoes = shoes
+		}
+	}
+
+	displayName := collectionName.String
+	if displayName == "" {
+		displayName = colorName
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": map[string]interface{}{
+			"id":              colorID.String(),
+			"name":            displayName,
+			"color_name":      colorName,
+			"color_code":      colorCode.String,
+			"price":           price,
+			"discount":        discount.Float64,
+			"type_name":       typeName.String,
+			"description":     description.String,
+			"images":          images,
+			"other_colors":    otherColors,
+			"canonical_colors": canonicalColors,
+			"matched_bag":     matchedBag,
+			"matched_shoes":   matchedShoes,
+		},
+	})
+}
+
+// GetMelhafaCollectionDetail handles GET /api/v1/public/melhafas/collection/:id (deprecated - kept for backward compatibility)
+// Returns a single Melhafa collection with matched bags and shoes for detail screen
+func GetMelhafaCollectionDetail(c *gin.Context) {
+	collectionIDStr := c.Param("id")
+	collectionID, err := uuid.Parse(collectionIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid collection ID"})
+		return
+	}
+
+	// Get collection details
+	var id, typeID uuid.UUID
+	var name, typeName string
+	var description sql.NullString
+	var isActive bool
+	var sortOrder int
+
+	err = database.Database.QueryRow(`
+		SELECT mc.id, mc.type_id, mc.name, mc.description, mc.is_active, mc.sort_order,
+		       mt.name as type_name
+		FROM melhaf_collections mc
+		JOIN melhaf_types mt ON mc.type_id = mt.id
+		WHERE mc.id = $1 AND mc.is_active = TRUE AND mt.is_active = TRUE
+	`, collectionID).Scan(&id, &typeID, &name, &description, &isActive, &sortOrder, &typeName)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Collection not found"})
+		} else {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch collection"})
+		}
+		return
+	}
+
+	// Get first active color for the main image
+	var mainColorID uuid.UUID
+	var mainColorName string
+	var mainImageURL sql.NullString
+	database.Database.QueryRow(`
+		SELECT mc.id, mc.name, 
+		       COALESCE((SELECT url FROM melhaf_color_images WHERE color_id = mc.id ORDER BY position LIMIT 1), '') as image_url
+		FROM melhaf_colors mc
+		WHERE mc.collection_id = $1 AND mc.is_active = TRUE
+		ORDER BY mc.sort_order, mc.created_at
+		LIMIT 1
+	`, id).Scan(&mainColorID, &mainColorName, &mainImageURL)
+
+	// Get all colors for this collection
+	colorRows, _ := database.Database.Query(`
+		SELECT mc.id, mc.name, mc.name_ar, mc.color_code, mc.price, mc.discount,
+		       COALESCE((SELECT url FROM melhaf_color_images WHERE color_id = mc.id ORDER BY position LIMIT 1), '') as image_url
+		FROM melhaf_colors mc
+		WHERE mc.collection_id = $1 AND mc.is_active = TRUE
+		ORDER BY mc.sort_order
+	`, id)
+
+	var colors []map[string]interface{}
+	for colorRows.Next() {
+		var colorID uuid.UUID
+		var colorName string
+		var nameAr, colorCode sql.NullString
+		var price float64
+		var discount sql.NullFloat64
+		var imageURL sql.NullString
+
+		if err := colorRows.Scan(&colorID, &colorName, &nameAr, &colorCode, &price, &discount, &imageURL); err == nil {
+			colors = append(colors, map[string]interface{}{
+				"id":         colorID.String(),
+				"name":       colorName,
+				"name_ar":    nameAr.String,
+				"color_code": colorCode.String,
+				"price":      price,
+				"discount":   discount.Float64,
+				"image_url":  imageURL.String,
+			})
+		}
+	}
+	colorRows.Close()
+
+	// Find matching products (bag and shoes) - ONLY for detail screen
+	var matchedBag, matchedShoes []map[string]interface{}
+	if mainColorID != uuid.Nil {
+		bags, shoes, err := services.FindMatchingProducts(mainColorID, 1, 1)
+		if err == nil {
+			matchedBag = bags
+			matchedShoes = shoes
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": map[string]interface{}{
+			"id":            id.String(),
+			"type_id":       typeID.String(),
+			"type_name":     typeName,
+			"name":          name,
+			"description":   description.String,
+			"is_active":     isActive,
+			"sort_order":    sortOrder,
+			"main_image":    mainImageURL.String,
+			"colors":        colors,
+			"matched_bag":   matchedBag,
+			"matched_shoes": matchedShoes,
+		},
+	})
 }
 
 // ==================== VIDEO LIKES & REACTIONS ====================

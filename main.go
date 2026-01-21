@@ -230,6 +230,12 @@ func main() {
 			products.GET("/most-viewed", handlers.GetMostViewedProducts)
 			products.GET("/most-viewed/category/:categoryId", handlers.GetMostViewedProductsByCategory)
 			products.GET("/recently-viewed", handlers.AuthMiddleware(), handlers.GetUserRecentlyViewedProducts)
+			products.GET("/suggested-for-you", handlers.GetSuggestedForYou) // Works with auth or phone_number query param
+			
+			// Product notification routes (protected)
+			products.POST("/:id/notify", handlers.AuthMiddleware(), handlers.SubscribeToProductNotification)
+			products.DELETE("/:id/notify", handlers.AuthMiddleware(), handlers.UnsubscribeFromProductNotification)
+			products.GET("/:id/notify/status", handlers.AuthMiddleware(), handlers.CheckProductNotificationStatus)
 		}
 
 		// Category routes
@@ -249,6 +255,8 @@ func main() {
 		api.GET("/public/products", handlers.SearchProducts)
 		api.GET("/public/products/enhanced", handlers.EnhancedSearchProducts)
 		api.GET("/public/category-hierarchy", handlers.GetCategoryHierarchy)
+		api.GET("/public/products/:id/colors", handlers.PublicGetProductColors)
+		api.GET("/public/products/colors/:id/matches", handlers.PublicPreviewProductMatches)
 
 		// Brand routes
 		brands := api.Group("/brands")
@@ -385,6 +393,10 @@ func main() {
 			admin.DELETE("/products/:id", handlers.DeleteProduct)
 			admin.POST("/upload", handlers.UploadImage)
 			
+			// Product notification management
+			admin.GET("/products/:id/notifications", handlers.GetProductNotificationSubscribers)
+			admin.GET("/products/notifications", handlers.GetProductsWithNotifications)
+			
 		// Barcode management
 		admin.POST("/barcode/scan", handlers.ScanBarcode)
 		admin.GET("/barcode/generate/:ean", handlers.GenerateBarcodeImage)
@@ -399,6 +411,8 @@ func main() {
 		api.GET("/quartiers", handlers.GetAllQuartiers)
 		
 		// Public Melhaf routes
+		api.GET("/public/melhafas/home", handlers.GetMelhafasForHome)
+		api.GET("/public/melhafas/:id", handlers.GetMelhafaDetail)
 		api.GET("/melhaf/videos", handlers.GetMelhafVideos)
 		api.GET("/melhaf/colors/:id", handlers.GetMelhafColorDetails)
 		
@@ -451,6 +465,18 @@ func main() {
 		admin.POST("/melhaf/colors/:id/images", handlers.AdminUploadMelhafImage)
 		admin.POST("/melhaf/videos", handlers.AdminUploadMelhafVideo)
 		admin.PUT("/melhaf/colors/:id/inventory", handlers.AdminUpdateMelhafInventory)
+		admin.POST("/melhaf/colors/:id/canonical-colors", handlers.AdminAssignCanonicalColorToMelhaf)
+		admin.GET("/melhaf/colors/:id/matches", handlers.AdminPreviewMelhafMatches)
+		
+		// Canonical colors management
+		admin.GET("/canonical-colors", handlers.AdminGetCanonicalColors)
+		admin.POST("/canonical-colors", handlers.AdminCreateCanonicalColor)
+		admin.PUT("/canonical-colors/:id", handlers.AdminUpdateCanonicalColor)
+		admin.DELETE("/canonical-colors/:id", handlers.AdminDeleteCanonicalColor)
+		
+		// Product color canonical color assignment
+		admin.POST("/products/colors/:id/canonical-colors", handlers.AdminAssignCanonicalColorToProduct)
+		admin.GET("/products/colors/:id/matches", handlers.AdminPreviewProductMatches)
 		
 		// Maison Adrar management routes
 		admin.GET("/maison-adrar/categories", handlers.AdminGetMaisonAdrarCategories)
@@ -538,6 +564,28 @@ func main() {
 		for range ticker.C {
 			if err := scheduler.ProcessScheduledNotifications(); err != nil {
 				log.Printf("⚠️ Error processing scheduled notifications: %v", err)
+			}
+		}
+	}()
+	
+	// Start background task for scheduling product suggestion notifications
+	go func() {
+		scheduler := services.NewNotificationScheduler()
+		suggestionTicker := time.NewTicker(6 * time.Hour) // Check every 6 hours
+		defer suggestionTicker.Stop()
+		
+		log.Println("🎯 Background product suggestion scheduler started")
+		
+		// Schedule suggestions immediately on startup (with delay)
+		time.Sleep(1 * time.Hour) // Wait 1 hour after startup
+		if err := scheduler.ScheduleSuggestedProductNotifications(); err != nil {
+			log.Printf("⚠️ Error scheduling product suggestions: %v", err)
+		}
+		
+		// Schedule periodically
+		for range suggestionTicker.C {
+			if err := scheduler.ScheduleSuggestedProductNotifications(); err != nil {
+				log.Printf("⚠️ Error scheduling product suggestions: %v", err)
 			}
 		}
 	}()

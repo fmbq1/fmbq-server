@@ -6,13 +6,15 @@ import (
 	"time"
 
 	"fmbq-server/database"
+
 	"github.com/google/uuid"
 )
 
-// NotificationScheduler handles scheduling and sending cart/wishlist reminders
+// NotificationScheduler handles scheduling and sending cart/wishlist reminders and product suggestions
 type NotificationScheduler struct {
 	notificationService *NotificationService
 }
+
 
 // NewNotificationScheduler creates a new notification scheduler
 func NewNotificationScheduler() *NotificationScheduler {
@@ -231,24 +233,41 @@ func (ns *NotificationScheduler) ProcessScheduledNotifications() error {
 		notifications = append(notifications, notif)
 	}
 
-	// Process each notification
-	for _, notif := range notifications {
-		// Check if cart/wishlist still has items (validation)
-		shouldSend := false
-		if notif.Type == "cart-reminder" {
-			shouldSend = ns.validateCartHasItems(notif.UserID)
-		} else if notif.Type == "wishlist-reminder" {
-			if notif.ProductID.Valid {
-				productUUID, _ := uuid.Parse(notif.ProductID.String)
-				shouldSend = ns.validateWishlistHasProduct(notif.UserID, productUUID)
+		// Process each notification with delays to avoid overwhelming users
+		lastUserSentTime := make(map[uuid.UUID]time.Time)
+		delayBetweenNotifications := 30 * time.Minute // Minimum 30 minutes between notifications to same user
+		
+		for _, notif := range notifications {
+			// Check if we should delay this notification (avoid overwhelming user)
+			if lastSentTime, exists := lastUserSentTime[notif.UserID]; exists {
+				timeSinceLastNotification := time.Since(lastSentTime)
+				if timeSinceLastNotification < delayBetweenNotifications {
+					// Skip this notification for now, reschedule it
+					newScheduledTime := lastSentTime.Add(delayBetweenNotifications)
+					ns.rescheduleNotification(notif.ID, newScheduledTime)
+					continue
+				}
 			}
-		}
+			
+			// Check if cart/wishlist still has items (validation)
+			shouldSend := false
+			if notif.Type == "cart-reminder" {
+				shouldSend = ns.validateCartHasItems(notif.UserID)
+			} else if notif.Type == "wishlist-reminder" {
+				if notif.ProductID.Valid {
+					productUUID, _ := uuid.Parse(notif.ProductID.String)
+					shouldSend = ns.validateWishlistHasProduct(notif.UserID, productUUID)
+				}
+			} else if notif.Type == "product-suggestion" {
+				// Product suggestions are always valid to send
+				shouldSend = true
+			}
 
-		if !shouldSend {
-			// Mark as cancelled since item no longer exists
-			ns.markNotificationCancelled(notif.ID)
-			continue
-		}
+			if !shouldSend {
+				// Mark as cancelled since item no longer exists
+				ns.markNotificationCancelled(notif.ID)
+				continue
+			}
 
 		// Get user's push token
 		var pushToken sql.NullString
@@ -268,8 +287,13 @@ func (ns *NotificationScheduler) ProcessScheduledNotifications() error {
 
 		// Send notification
 		data := map[string]interface{}{
-			"type":       notif.Type,
-			"product_id": notif.ProductID.String,
+			"type":        notif.Type,
+			"product_id":  func() string {
+				if notif.ProductID.Valid {
+					return notif.ProductID.String
+				}
+				return ""
+			}(),
 			"product_name": notif.ProductName,
 		}
 
@@ -288,10 +312,22 @@ func (ns *NotificationScheduler) ProcessScheduledNotifications() error {
 
 		// Mark as sent
 		ns.markNotificationSent(notif.ID)
+		lastUserSentTime[notif.UserID] = time.Now()
 		fmt.Printf("✅ Sent scheduled notification %s to user %s\n", notif.ID, notif.UserID)
 	}
 
 	return nil
+}
+
+// rescheduleNotification updates the scheduled_for time for a notification
+func (ns *NotificationScheduler) rescheduleNotification(notificationID uuid.UUID, newTime time.Time) error {
+	query := `
+		UPDATE scheduled_notifications 
+		SET scheduled_for = $1, updated_at = now()
+		WHERE id = $2
+	`
+	_, err := database.Database.Exec(query, newTime, notificationID)
+	return err
 }
 
 // validateCartHasItems checks if user still has items in cart
@@ -364,6 +400,9 @@ func (ns *NotificationScheduler) generateNotificationMessage(notificationType, r
 			title = "Wishlist reminder"
 			body = fmt.Sprintf("You saved %s to your wishlist", productName)
 		}
+	case "product-suggestion":
+		title = "Just for you! ✨"
+		body = fmt.Sprintf("We found something you might love: %s", productName)
 	default:
 		title = "Reminder"
 		body = fmt.Sprintf("Don't forget about %s", productName)
@@ -371,3 +410,196 @@ func (ns *NotificationScheduler) generateNotificationMessage(notificationType, r
 	return title, body
 }
 
+// ScheduleSuggestedProductNotifications schedules notifications for suggested products based on view history
+// This runs periodically to check users with view history and schedule product suggestions
+func (ns *NotificationScheduler) ScheduleSuggestedProductNotifications() error {
+	// Get users who have:
+	// 1. Push token enabled
+	// 2. Viewed products in the last 7 days
+	// 3. Don't have a pending product-suggestion notification scheduled in the next 24 hours
+	query := `
+		WITH users_with_views AS (
+			SELECT DISTINCT 
+				COALESCE(pv.user_id, 
+					(SELECT id FROM users WHERE phone = pv.phone_number LIMIT 1)
+				) as user_id,
+				pv.phone_number
+			FROM product_views pv
+			WHERE pv.view_timestamp > NOW() - INTERVAL '7 days'
+			AND (
+				pv.user_id IS NOT NULL 
+				OR (pv.phone_number IS NOT NULL AND pv.phone_number != '')
+			)
+		),
+		users_with_token AS (
+			SELECT u.id, u.push_token
+			FROM users u
+			INNER JOIN users_with_views uvw ON u.id = uvw.user_id
+			WHERE u.push_token IS NOT NULL 
+			AND u.push_token != ''
+		),
+		users_needing_notifications AS (
+			SELECT uwt.id, uwt.push_token
+			FROM users_with_token uwt
+			WHERE NOT EXISTS (
+				SELECT 1 FROM scheduled_notifications sn
+				WHERE sn.user_id = uwt.id
+				AND sn.type = 'product-suggestion'
+				AND sn.scheduled_for > NOW()
+				AND sn.scheduled_for <= NOW() + INTERVAL '24 hours'
+				AND sn.sent = FALSE
+				AND sn.cancelled = FALSE
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM scheduled_notifications sn2
+				WHERE sn2.user_id = uwt.id
+				AND sn2.type = 'product-suggestion'
+				AND sn2.sent = FALSE
+				AND sn2.cancelled = FALSE
+				AND sn2.created_at > NOW() - INTERVAL '1 day'
+			)
+		)
+		SELECT id FROM users_needing_notifications
+		LIMIT 50
+	`
+	
+	rows, err := database.Database.Query(query)
+	if err != nil {
+		return fmt.Errorf("failed to fetch users needing suggestions: %w", err)
+	}
+	defer rows.Close()
+	
+	var userIDs []uuid.UUID
+	for rows.Next() {
+		var userID uuid.UUID
+		if err := rows.Scan(&userID); err == nil {
+			userIDs = append(userIDs, userID)
+		}
+	}
+	
+	// For each user, get their suggested products and schedule notifications
+	for _, userID := range userIDs {
+		if err := ns.scheduleSuggestionsForUser(userID); err != nil {
+			fmt.Printf("⚠️ Failed to schedule suggestions for user %s: %v\n", userID, err)
+			continue
+		}
+	}
+	
+	fmt.Printf("✅ Scheduled product suggestion notifications for %d users\n", len(userIDs))
+	return nil
+}
+
+// scheduleSuggestionsForUser schedules product suggestion notifications for a specific user
+func (ns *NotificationScheduler) scheduleSuggestionsForUser(userID uuid.UUID) error {
+	// Get user's suggested products (similar to GetSuggestedForYou API)
+	suggestedQuery := `
+		WITH viewed_products AS (
+			SELECT DISTINCT product_id
+			FROM product_views
+			WHERE user_id = $1
+			AND view_timestamp > NOW() - INTERVAL '30 days'
+			ORDER BY MAX(view_timestamp) DESC
+			LIMIT 50
+		),
+		viewed_product_data AS (
+			SELECT DISTINCT
+				vp.product_id,
+				pm.brand_id,
+				array_agg(DISTINCT c.id) FILTER (WHERE c.level = 1) as level1_categories,
+				array_agg(DISTINCT c.id) FILTER (WHERE c.level = 2) as level2_categories,
+				array_agg(DISTINCT c.id) FILTER (WHERE c.level = 3) as level3_categories
+			FROM viewed_products vp
+			JOIN product_models pm ON vp.product_id = pm.id
+			LEFT JOIN product_model_categories pmc ON pm.id = pmc.product_model_id
+			LEFT JOIN categories c ON pmc.category_id = c.id
+			GROUP BY vp.product_id, pm.brand_id
+		),
+		suggested_products AS (
+			SELECT DISTINCT
+				pm.id,
+				pm.title,
+				COALESCE(pi.url, '') as image_url,
+				COALESCE(MIN(pr.sale_price), MIN(pr.list_price), 0) as price
+			FROM product_models pm
+			LEFT JOIN skus s ON pm.id = s.product_model_id
+			LEFT JOIN prices pr ON s.id = pr.sku_id AND pr.currency = 'MRO'
+			LEFT JOIN LATERAL (
+				SELECT url 
+				FROM product_images 
+				WHERE product_model_id = pm.id 
+				ORDER BY position, created_at
+				LIMIT 1
+			) pi ON true
+			CROSS JOIN viewed_product_data vpd
+			WHERE pm.is_active = true
+			AND pm.id != ALL(SELECT product_id FROM viewed_products)
+			AND pi.url IS NOT NULL AND pi.url != ''
+			GROUP BY pm.id, pm.title, pi.url, vpd.level1_categories, vpd.level2_categories, vpd.level3_categories, vpd.brand_id
+			HAVING (
+				EXISTS (
+					SELECT 1 FROM viewed_product_data vpd2
+					JOIN product_model_categories pmc2 ON pmc2.product_model_id = pm.id
+					JOIN categories c2 ON pmc2.category_id = c2.id
+					WHERE (c2.id = ANY(vpd2.level1_categories) OR c2.id = ANY(vpd2.level2_categories) OR c2.id = ANY(vpd2.level3_categories))
+				) OR EXISTS (
+					SELECT 1 FROM viewed_product_data vpd3
+					WHERE vpd3.brand_id = pm.brand_id AND pm.brand_id IS NOT NULL
+				)
+			)
+			ORDER BY price ASC
+			LIMIT 3
+		)
+		SELECT id, title, image_url, price FROM suggested_products
+	`
+	
+	rows, err := database.Database.Query(suggestedQuery, userID)
+	if err != nil {
+		return fmt.Errorf("failed to fetch suggested products: %w", err)
+	}
+	defer rows.Close()
+	
+	type SuggestedProduct struct {
+		ID       uuid.UUID
+		Title    string
+		ImageURL string
+		Price    float64
+	}
+	
+	var products []SuggestedProduct
+	for rows.Next() {
+		var p SuggestedProduct
+		if err := rows.Scan(&p.ID, &p.Title, &p.ImageURL, &p.Price); err == nil {
+			products = append(products, p)
+		}
+	}
+	
+	if len(products) == 0 {
+		return nil // No suggestions for this user
+	}
+	
+	// Schedule notifications with delays between them (24h, 48h, 72h) to avoid overwhelming users
+	baseTime := time.Now().Add(24 * time.Hour)
+	for i, product := range products {
+		scheduledFor := baseTime.Add(time.Duration(i) * 24 * time.Hour)
+		productID := &product.ID
+		
+		err := ns.createScheduledNotification(
+			userID,
+			"product-suggestion",
+			"daily",
+			productID,
+			product.Title,
+			product.ImageURL,
+			product.Price,
+			scheduledFor,
+		)
+		
+		if err != nil {
+			fmt.Printf("⚠️ Failed to schedule suggestion notification for user %s, product %s: %v\n", 
+				userID, product.ID, err)
+			continue
+		}
+	}
+	
+	return nil
+}

@@ -79,6 +79,10 @@ func (db *DB) InitializeTables() error {
 		models.MelhafInventory{},
 		models.MelhafVideoLike{},
 		models.MelhafVideoReaction{},
+		// Color matching models
+		models.CanonicalColor{},
+		models.MelhafColorCanonicalMatch{},
+		models.ProductColorCanonicalMatch{},
 		// Maison Adrar models
 		models.MaisonAdrarCategory{},
 		models.MaisonAdrarCollection{},
@@ -89,6 +93,7 @@ func (db *DB) InitializeTables() error {
 		models.FeedBlockItem{},
 		models.Campaign{},
 		models.ScheduledNotification{},
+		models.ProductNotification{},
 	}
 
 	for _, model := range models {
@@ -165,6 +170,40 @@ func (db *DB) runMigrations() error {
 		`ALTER TABLE maison_adrar_perfume_colors ADD COLUMN IF NOT EXISTS price_override NUMERIC(12,2);`,
 		`ALTER TABLE maison_adrar_perfume_colors ADD COLUMN IF NOT EXISTS volume_ml INTEGER;`,
 		`ALTER TABLE maison_adrar_perfume_colors ADD COLUMN IF NOT EXISTS stock INTEGER;`,
+		
+		// Canonical colors migration (color matching system)
+		`CREATE TABLE IF NOT EXISTS canonical_colors (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			internal_key TEXT NOT NULL UNIQUE,
+			name_en TEXT NOT NULL,
+			name_fr TEXT NOT NULL,
+			color_code TEXT,
+			is_active BOOLEAN DEFAULT TRUE,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+			updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_canonical_colors_internal_key ON canonical_colors(internal_key);`,
+		`CREATE INDEX IF NOT EXISTS idx_canonical_colors_active ON canonical_colors(is_active);`,
+		
+		`CREATE TABLE IF NOT EXISTS melhaf_color_canonical_matches (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			melhaf_color_id UUID NOT NULL REFERENCES melhaf_colors(id) ON DELETE CASCADE,
+			canonical_color_id UUID NOT NULL REFERENCES canonical_colors(id) ON DELETE CASCADE,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+			UNIQUE(melhaf_color_id, canonical_color_id)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_melhaf_color_matches_color ON melhaf_color_canonical_matches(melhaf_color_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_melhaf_color_matches_canonical ON melhaf_color_canonical_matches(canonical_color_id);`,
+		
+		`CREATE TABLE IF NOT EXISTS product_color_canonical_matches (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			product_color_id UUID NOT NULL REFERENCES product_colors(id) ON DELETE CASCADE,
+			canonical_color_id UUID NOT NULL REFERENCES canonical_colors(id) ON DELETE CASCADE,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+			UNIQUE(product_color_id, canonical_color_id)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_product_color_matches_color ON product_color_canonical_matches(product_color_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_product_color_matches_canonical ON product_color_canonical_matches(canonical_color_id);`,
 		
 		
 		// Create address book tables
@@ -338,16 +377,21 @@ func (db *DB) runMigrations() error {
 			product_id UUID NOT NULL REFERENCES product_models(id) ON DELETE CASCADE,
 			user_id UUID REFERENCES users(id) ON DELETE SET NULL,
 			anonymous_session_id VARCHAR(255),
+			phone_number VARCHAR(20),
 			view_timestamp TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
 			ip_address INET,
 			user_agent TEXT,
 			created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 		);`,
+
+		// Migration: add phone_number column to product_views for older DBs
+		`ALTER TABLE product_views ADD COLUMN IF NOT EXISTS phone_number VARCHAR(20);`,
 		
 		// Indexes for product views performance
 		`CREATE INDEX IF NOT EXISTS idx_product_views_product_id ON product_views(product_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_product_views_user_id ON product_views(user_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_product_views_anonymous_session ON product_views(anonymous_session_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_product_views_phone_number ON product_views(phone_number);`,
 		`CREATE INDEX IF NOT EXISTS idx_product_views_timestamp ON product_views(view_timestamp);`,
 		`CREATE INDEX IF NOT EXISTS idx_product_views_composite ON product_views(product_id, view_timestamp);`,
 		
@@ -370,8 +414,8 @@ func (db *DB) runMigrations() error {
 		`CREATE TABLE IF NOT EXISTS scheduled_notifications (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 			user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			type VARCHAR(50) NOT NULL CHECK (type IN ('cart-reminder', 'wishlist-reminder')),
-			reminder_type VARCHAR(20) NOT NULL CHECK (reminder_type IN ('6h', '24h', '3d', 'weekly')),
+			type VARCHAR(50) NOT NULL CHECK (type IN ('cart-reminder', 'wishlist-reminder', 'product-suggestion')),
+			reminder_type VARCHAR(20) NOT NULL CHECK (reminder_type IN ('6h', '24h', '3d', 'weekly', 'daily')),
 			product_id UUID,
 			product_name TEXT NOT NULL,
 			product_image_url TEXT NOT NULL,
@@ -382,6 +426,28 @@ func (db *DB) runMigrations() error {
 			created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
 			updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 		);`,
+		// Migration: Update constraints if they don't already support new types
+		`DO $$ 
+		BEGIN 
+			-- Drop old constraints if they exist
+			ALTER TABLE scheduled_notifications 
+			DROP CONSTRAINT IF EXISTS scheduled_notifications_type_check;
+			ALTER TABLE scheduled_notifications 
+			DROP CONSTRAINT IF EXISTS scheduled_notifications_reminder_type_check;
+			
+			-- Add updated constraints
+			ALTER TABLE scheduled_notifications 
+			ADD CONSTRAINT scheduled_notifications_type_check 
+			CHECK (type IN ('cart-reminder', 'wishlist-reminder', 'product-suggestion'));
+			
+			ALTER TABLE scheduled_notifications 
+			ADD CONSTRAINT scheduled_notifications_reminder_type_check 
+			CHECK (reminder_type IN ('6h', '24h', '3d', 'weekly', 'daily'));
+		EXCEPTION 
+			WHEN others THEN
+				-- Constraints might already exist, ignore error
+				NULL;
+		END $$;`,
 		`CREATE INDEX IF NOT EXISTS idx_scheduled_notifications_user_id ON scheduled_notifications(user_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_scheduled_notifications_scheduled_for ON scheduled_notifications(scheduled_for);`,
 		`CREATE INDEX IF NOT EXISTS idx_scheduled_notifications_sent ON scheduled_notifications(sent);`,

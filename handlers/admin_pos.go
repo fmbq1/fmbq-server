@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 type AdminOrderSummary struct {
@@ -266,11 +268,38 @@ func AdminUpdateQuantity(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid quantities"})
         return
     }
+    
+    // Get old available quantity to detect stock changes
+    var oldAvailable int
+    var productID uuid.UUID
+    err := DB.QueryRow(`
+        SELECT COALESCE(i.available, 0), s.product_model_id 
+        FROM inventory i
+        JOIN skus s ON i.sku_id = s.id
+        WHERE i.sku_id = $1
+    `, skuID).Scan(&oldAvailable, &productID)
+    
+    if err != nil {
+        fmt.Printf("⚠️ Failed to get old inventory: %v\n", err)
+    }
+    
+    parsedSKUID, _ := uuid.Parse(skuID)
+    
     if _, err := DB.Exec(`UPDATE inventory SET available = $1, reserved = $2, updated_at = now() WHERE sku_id = $3`, 
                         body.Available, body.Reserved, skuID); err != nil {
         c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update quantities"})
         return
     }
+    
+    // Check if stock changed from 0 to >0 and trigger notifications
+    if err == nil && oldAvailable == 0 && body.Available > 0 {
+        go func() {
+            if err := TriggerNotificationsForProduct(productID, &parsedSKUID); err != nil {
+                fmt.Printf("⚠️ Failed to trigger notifications: %v\n", err)
+            }
+        }()
+    }
+    
     c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 

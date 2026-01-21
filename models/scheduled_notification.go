@@ -32,8 +32,8 @@ func (ScheduledNotification) CreateTableSQL() string {
 	CREATE TABLE IF NOT EXISTS scheduled_notifications (
 		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 		user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-		type VARCHAR(50) NOT NULL CHECK (type IN ('cart-reminder', 'wishlist-reminder')),
-		reminder_type VARCHAR(20) NOT NULL CHECK (reminder_type IN ('6h', '24h', '3d', 'weekly')),
+		type VARCHAR(50) NOT NULL CHECK (type IN ('cart-reminder', 'wishlist-reminder', 'product-suggestion')),
+		reminder_type VARCHAR(20) NOT NULL CHECK (reminder_type IN ('6h', '24h', '3d', 'weekly', 'daily')),
 		product_id UUID,
 		product_name TEXT NOT NULL,
 		product_image_url TEXT NOT NULL,
@@ -43,6 +43,28 @@ func (ScheduledNotification) CreateTableSQL() string {
 		cancelled BOOLEAN DEFAULT FALSE,
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
 		updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
-	);`
+	);
+	
+	-- Add product-suggestion type if not exists (migration support)
+	DO $$ 
+	BEGIN 
+		IF EXISTS (
+			SELECT 1 FROM information_schema.table_constraints 
+			WHERE constraint_name LIKE '%scheduled_notifications_type_check%'
+		) THEN
+			ALTER TABLE scheduled_notifications 
+			DROP CONSTRAINT IF EXISTS scheduled_notifications_type_check;
+		END IF;
+		ALTER TABLE scheduled_notifications 
+		ADD CONSTRAINT scheduled_notifications_type_check 
+		CHECK (type IN ('cart-reminder', 'wishlist-reminder', 'product-suggestion'));
+		
+		-- Update reminder_type constraint
+		ALTER TABLE scheduled_notifications 
+		DROP CONSTRAINT IF EXISTS scheduled_notifications_reminder_type_check;
+		ALTER TABLE scheduled_notifications 
+		ADD CONSTRAINT scheduled_notifications_reminder_type_check 
+		CHECK (reminder_type IN ('6h', '24h', '3d', 'weekly', 'daily'));
+	END $$;`
 }
 

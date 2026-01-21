@@ -64,10 +64,10 @@ func (MelhafCollection) CreateTableSQL() string {
 	);`
 }
 
-// MelhafColor represents a color variant of a collection
+// MelhafColor represents a color variant of a collection (or standalone)
 type MelhafColor struct {
 	ID           uuid.UUID  `json:"id" db:"id"`
-	CollectionID uuid.UUID  `json:"collection_id" db:"collection_id"`
+	CollectionID *uuid.UUID `json:"collection_id" db:"collection_id"` // Optional - allows standalone Melhafs
 	Name         string     `json:"name" db:"name"`
 	NameAr       *string    `json:"name_ar" db:"name_ar"`
 	ColorCode    *string    `json:"color_code" db:"color_code"` // Hex color code
@@ -88,7 +88,7 @@ func (MelhafColor) CreateTableSQL() string {
 	return `
 	CREATE TABLE IF NOT EXISTS melhaf_colors (
 		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		collection_id UUID NOT NULL REFERENCES melhaf_collections(id) ON DELETE CASCADE,
+		collection_id UUID REFERENCES melhaf_collections(id) ON DELETE CASCADE,
 		name TEXT NOT NULL,
 		name_ar TEXT,
 		color_code TEXT,
@@ -99,7 +99,9 @@ func (MelhafColor) CreateTableSQL() string {
 		sort_order INTEGER DEFAULT 0,
 		created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
 		updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
-	);`
+	);
+	-- Migration: Make collection_id nullable if it's not already
+	ALTER TABLE melhaf_colors ALTER COLUMN collection_id DROP NOT NULL;`
 }
 
 // MelhafColorImage represents images for a color
